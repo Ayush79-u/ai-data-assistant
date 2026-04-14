@@ -1,0 +1,122 @@
+Metadata-Version: 2.4
+Name: nl-data-assistant
+Version: 0.1.0
+Summary: Natural-language assistant for Excel, MySQL, and visual analytics.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+# AI-Powered Excel + MySQL Data Assistant
+
+This project gives you a Python starter system for interacting with Excel sheets and MySQL databases using natural language.
+
+Examples:
+
+- `Create a table of students with name and CGPA`
+- `Import expenses.xlsx to MySQL as monthly_expenses`
+- `Show monthly_expenses from MySQL`
+- `Show me a bar chart of monthly expenses`
+- `Export MySQL table students to Excel`
+
+The app translates commands into structured actions, cleans data, maps schemas, syncs Excel and MySQL in both directions, and generates charts or dashboards from the result.
+
+## Features
+
+- Natural-language command interpretation
+- Excel sheet creation, reading, writing, and schema inspection
+- MySQL table creation, querying, export, and schema inspection
+- Excel-to-MySQL import with cleaning and inferred schema mapping
+- MySQL-to-Excel export
+- Plotly-based bar, line, pie, scatter, histogram, and dashboard views
+- Streamlit UI for interactive use
+- CLI mode for quick testing
+- Optional OpenAI-powered parsing when you provide `OPENAI_API_KEY` and `OPENAI_MODEL`
+
+## Project Structure
+
+```text
+.
+|-- app.py
+|-- cli.py
+|-- requirements.txt
+|-- README.md
+|-- src/
+|   `-- nl_data_assistant/
+|       |-- config.py
+|       |-- models.py
+|       |-- streamlit_app.py
+|       |-- main.py
+|       |-- nlp/
+|       |   `-- interpreter.py
+|       |-- services/
+|       |   |-- engine.py
+|       |   |-- excel_service.py
+|       |   |-- mysql_service.py
+|       |   |-- sync_service.py
+|       |   `-- visualization_service.py
+|       `-- utils/
+|           |-- cleaning.py
+|           `-- schema.py
+`-- tests/
+```
+
+## How To Run In PyCharm
+
+1. Open the folder `C:\Users\AYUSH THAKUR\OneDrive\Documents\New project` in PyCharm.
+2. Create a virtual environment with Python 3.10 or newer.
+3. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+4. Copy `.env.example` to `.env` and fill in your MySQL connection details.
+5. Optional: add `OPENAI_API_KEY` and `OPENAI_MODEL` if you want LLM-based parsing.
+6. Start the UI:
+
+```bash
+streamlit run app.py
+```
+
+7. Or use the CLI:
+
+```bash
+python cli.py --command "Create a table of students with name and CGPA"
+```
+
+## Example Commands
+
+- `Create a table of students with name and CGPA`
+- `Create an Excel sheet of monthly expenses with month, category and amount`
+- `Import expenses.xlsx to MySQL as monthly_expenses`
+- `Show monthly_expenses from MySQL`
+- `Show monthly_expenses from Excel`
+- `Show me a line chart of monthly_expenses`
+- `Describe schema of students`
+- `Clean expenses.xlsx`
+- `Export MySQL table monthly_expenses to Excel`
+
+## Architecture
+
+- `CommandInterpreter` converts natural language into an `ActionPlan`
+- `DataAssistantEngine` dispatches the plan to the correct service
+- `ExcelService` handles workbook and sheet operations
+- `MySQLService` handles SQL operations through SQLAlchemy
+- `SyncService` moves data between Excel and MySQL
+- `DataCleaner` normalizes headers, trims strings, drops empty rows/columns, and infers types
+- `VisualizationService` creates interactive Plotly charts and dashboards
+
+## Important Notes
+
+- The default parser is rule-based and safe for the included commands.
+- If you enable OpenAI parsing, the app falls back to the rule-based parser when the API response is unavailable or invalid.
+- The project does not auto-create a MySQL server. You still need a running MySQL instance and valid credentials.
+- In this OneDrive-backed folder, Python bytecode caching may be restricted, so some verification tools that write `.pyc` files can fail even when source code is valid.
+
+## Next Upgrades You Can Add
+
+- More advanced SQL generation from natural language
+- Authentication and multi-user workspaces
+- Saved dashboards and chart templates
+- Row-level edit commands like `update student Ayush CGPA to 9.2`
+- FastAPI backend plus React frontend for deployment

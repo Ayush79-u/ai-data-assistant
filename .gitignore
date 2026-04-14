@@ -1,0 +1,15 @@
+.idea/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.env
+*.pyc
+*.pyo
+*.pyd
+
+data/uploads/
+outputs/*.html
+outputs/*.xlsx
+outputs/*.csv
+
