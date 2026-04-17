@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 
 from nl_data_assistant.models import ActionPlan, ColumnSpec
+from nl_data_assistant.nlp.local_parser import detect_intent, extract_entities
+from nl_data_assistant.nlp.mysql_query_generator import MySQLQueryGenerator
 from nl_data_assistant.utils.cleaning import normalize_identifier
 from nl_data_assistant.utils.schema import SchemaMapper
 
@@ -31,7 +33,7 @@ class LLMParser:
 You convert natural language data commands into JSON.
 Return only valid JSON with these keys:
 action, target, table_name, sheet_name, workbook_path, source_path, destination_path,
-columns, query, chart_type, x_column, y_column, title, limit, use_last_result, notes.
+columns, query, parameters, entities, chart_type, x_column, y_column, title, limit, use_last_result, notes.
 
 Command: {command}
 """
@@ -58,12 +60,14 @@ Command: {command}
                 destination_path=payload.get("destination_path"),
                 columns=columns,
                 query=payload.get("query"),
+                parameters=payload.get("parameters"),
                 chart_type=payload.get("chart_type"),
                 x_column=payload.get("x_column"),
                 y_column=payload.get("y_column"),
                 title=payload.get("title"),
                 limit=int(payload.get("limit", 200)),
                 use_last_result=bool(payload.get("use_last_result", False)),
+                entities=dict(payload.get("entities", {})),
                 notes=list(payload.get("notes", [])),
             )
         except Exception:
@@ -74,7 +78,7 @@ class RuleBasedInterpreter:
     def __init__(self, schema_mapper: SchemaMapper) -> None:
         self.schema_mapper = schema_mapper
 
-    def parse(self, command: str, default_target: str | None = None) -> ActionPlan:
+    def parse(self, command: str, default_target: str | None = None, mysql_schema: dict[str, list[str]] | None = None) -> ActionPlan:
         text = command.strip()
         lowered = text.lower()
         target = self._detect_target(lowered, default_target)
@@ -143,8 +147,14 @@ class RuleBasedInterpreter:
                 use_last_result=not bool(safe_entity),
             )
 
+        local_intent = detect_intent(text)
+        if local_intent and target != "excel" and not any(token in lowered for token in ("sheet", "worksheet", "workbook")):
+            local_plan = self._build_local_sql_plan(text, local_intent, mysql_schema=mysql_schema)
+            if local_plan:
+                return local_plan
+
         create_match = re.search(
-            r"create(?:\s+(?:a|an))?\s+(?P<object>mysql table|table|excel sheet|sheet|worksheet)"
+            r"create(?:\s+(?:a|an))?\s+(?P<object>excel sheet|sheet|worksheet)"
             r"(?:\s+of|\s+named)?\s*(?P<name>[\w\s]+?)(?:\s+with\s+(?P<columns>.+))?$",
             text,
             flags=re.IGNORECASE,
@@ -165,7 +175,7 @@ class RuleBasedInterpreter:
                 notes=["Column types were inferred from the natural-language request."],
             )
 
-        if any(keyword in lowered for keyword in ("show", "list", "display", "get", "fetch")):
+        if target == "excel" and any(keyword in lowered for keyword in ("show", "list", "display", "get", "fetch")):
             name = _match_group(r"(?:show|list|display|get|fetch)(?: me)?\s+(?P<name>[\w\s]+?)(?:\s+from|\s+in|\s*$)", text, "name")
             safe_name = normalize_identifier(name or "data")
             return ActionPlan(
@@ -183,6 +193,47 @@ class RuleBasedInterpreter:
                 "The command could not be mapped to a supported action.",
                 "Try create, show, import, export, clean, describe, or chart requests.",
             ],
+        )
+
+    def _build_local_sql_plan(self, text: str, intent: str, mysql_schema: dict[str, list[str]] | None = None) -> ActionPlan | None:
+        entities = extract_entities(text, intent=intent, schema_mapper=self.schema_mapper)
+        if not entities.get("table_name"):
+            return None
+
+        generator = MySQLQueryGenerator(schema_snapshot=mysql_schema, schema_mapper=self.schema_mapper)
+        try:
+            refined_entities = generator.refine_entities(entities, intent)
+            generated = generator.generate(intent, refined_entities)
+        except ValueError as exc:
+            return ActionPlan(
+                action="unknown",
+                target="mysql",
+                table_name=entities.get("table_name"),
+                entities=entities,
+                notes=[str(exc)],
+            )
+
+        action_map = {
+            "create_table": "create_table",
+            "insert": "insert",
+            "select": "query",
+            "update": "update",
+            "delete": "delete",
+        }
+        notes = [f"Local parser detected intent '{intent}' and generated parameterized SQL."]
+        if generated.preview_rows:
+            notes.append(f"Prepared {len(generated.preview_rows)} row(s) for insert.")
+
+        return ActionPlan(
+            action=action_map[intent],
+            target="mysql",
+            table_name=refined_entities.get("table_name"),
+            columns=refined_entities.get("column_specs", []),
+            query=generated.statement,
+            parameters=generated.parameters,
+            entities=refined_entities,
+            limit=int(refined_entities.get("limit", 200) or 200),
+            notes=notes,
         )
 
     def _detect_target(self, lowered: str, default_target: str | None) -> str | None:
@@ -207,8 +258,13 @@ class CommandInterpreter:
         self.rule_parser = RuleBasedInterpreter(self.schema_mapper)
         self.llm_parser = LLMParser(openai_api_key, openai_model) if (openai_api_key and openai_model) else None
 
-    def interpret(self, command: str, default_target: str | None = None) -> ActionPlan:
-        rule_plan = self.rule_parser.parse(command, default_target=default_target)
+    def interpret(
+        self,
+        command: str,
+        default_target: str | None = None,
+        mysql_schema: dict[str, list[str]] | None = None,
+    ) -> ActionPlan:
+        rule_plan = self.rule_parser.parse(command, default_target=default_target, mysql_schema=mysql_schema)
         if rule_plan.action != "unknown":
             return rule_plan
         if self.llm_parser:

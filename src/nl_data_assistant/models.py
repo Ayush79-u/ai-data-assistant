@@ -22,12 +22,14 @@ class ActionPlan:
     destination_path: str | None = None
     columns: list[ColumnSpec] = field(default_factory=list)
     query: str | None = None
+    parameters: Any = None
     chart_type: str | None = None
     x_column: str | None = None
     y_column: str | None = None
     title: str | None = None
     limit: int = 200
     use_last_result: bool = False
+    entities: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -43,4 +45,3 @@ class ExecutionResult:
     figure: Any = None
     file_path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-

@@ -15,12 +15,16 @@ The app translates commands into structured actions, cleans data, maps schemas, 
 ## Features
 
 - Natural-language command interpretation
+- Local structured parser for `create`, `insert`, `select`, `update`, and `delete`
+- Schema-aware MySQL query generator with table and column resolution
+- JSON table blueprint generator for schema + sample data output
 - Excel sheet creation, reading, writing, and schema inspection
 - MySQL table creation, querying, export, and schema inspection
 - Excel-to-MySQL import with cleaning and inferred schema mapping
 - MySQL-to-Excel export
 - Plotly-based bar, line, pie, scatter, histogram, and dashboard views
-- Streamlit UI for interactive use
+- Streamlit workbench UI for interactive use
+- FastAPI backend for parse and execute endpoints
 - CLI mode for quick testing
 - Optional OpenAI-powered parsing when you provide `OPENAI_API_KEY` and `OPENAI_MODEL`
 
@@ -30,16 +34,23 @@ The app translates commands into structured actions, cleans data, maps schemas, 
 .
 |-- app.py
 |-- cli.py
+|-- server.py
 |-- requirements.txt
 |-- README.md
 |-- src/
 |   `-- nl_data_assistant/
+|       |-- api.py
+|       |-- api_models.py
 |       |-- config.py
+|       |-- examples.py
 |       |-- models.py
 |       |-- streamlit_app.py
 |       |-- main.py
 |       |-- nlp/
 |       |   `-- interpreter.py
+|       |   `-- local_parser.py
+|       |   `-- mysql_query_generator.py
+|       |   `-- table_blueprint.py
 |       |-- services/
 |       |   |-- engine.py
 |       |   |-- excel_service.py
@@ -71,7 +82,13 @@ pip install -e .
 streamlit run app.py
 ```
 
-7. Or use the CLI:
+7. Start the FastAPI backend:
+
+```bash
+uvicorn server:app --reload
+```
+
+8. Or use the CLI:
 
 ```bash
 python cli.py --command "Create a table of students with name and CGPA"
@@ -80,9 +97,15 @@ python cli.py --command "Create a table of students with name and CGPA"
 ## Example Commands
 
 - `Create a table of students with name and CGPA`
+- `Insert 5 students with random CGPA`
+- `Add 3 students`
+- `Show all students`
+- `Show names and cgpa of students order by cgpa desc`
+- `Delete students with CGPA less than 6`
+- `Create employee table with name, salary`
+- `Make table of products with price and quantity`
 - `Create an Excel sheet of monthly expenses with month, category and amount`
 - `Import expenses.xlsx to MySQL as monthly_expenses`
-- `Show monthly_expenses from MySQL`
 - `Show monthly_expenses from Excel`
 - `Show me a line chart of monthly_expenses`
 - `Describe schema of students`
@@ -91,25 +114,22 @@ python cli.py --command "Create a table of students with name and CGPA"
 
 ## Architecture
 
-- `CommandInterpreter` converts natural language into an `ActionPlan`
+- `local_parser.py` handles intent detection, entity extraction, random row generation, and SQL generation without any external AI API
+- `mysql_query_generator.py` refines parsed entities with real MySQL schema information so table and column names resolve more accurately
+- `table_blueprint.py` converts create-table commands into JSON containing table name, MySQL-compatible columns, and sample data
+- `CommandInterpreter` converts natural language into an `ActionPlan` and can still fall back to OpenAI if you enable it
 - `DataAssistantEngine` dispatches the plan to the correct service
 - `ExcelService` handles workbook and sheet operations
 - `MySQLService` handles SQL operations through SQLAlchemy
 - `SyncService` moves data between Excel and MySQL
 - `DataCleaner` normalizes headers, trims strings, drops empty rows/columns, and infers types
 - `VisualizationService` creates interactive Plotly charts and dashboards
+- `api.py` exposes the same parser and execution engine through FastAPI endpoints such as `/parse`, `/blueprint`, `/execute`, `/health`, and `/schema`
 
 ## Important Notes
 
 - The default parser is rule-based and safe for the included commands.
 - If you enable OpenAI parsing, the app falls back to the rule-based parser when the API response is unavailable or invalid.
 - The project does not auto-create a MySQL server. You still need a running MySQL instance and valid credentials.
+- If MySQL is configured, the parser now tries to inspect table schemas and use them to generate cleaner SQL.
 - In this OneDrive-backed folder, Python bytecode caching may be restricted, so some verification tools that write `.pyc` files can fail even when source code is valid.
-
-## Next Upgrades You Can Add
-
-- More advanced SQL generation from natural language
-- Authentication and multi-user workspaces
-- Saved dashboards and chart templates
-- Row-level edit commands like `update student Ayush CGPA to 9.2`
-- FastAPI backend plus React frontend for deployment

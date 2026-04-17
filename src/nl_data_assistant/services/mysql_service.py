@@ -4,6 +4,7 @@ from typing import Any
 
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import NoSuchTableError
 
 from nl_data_assistant.models import ColumnSpec
 from nl_data_assistant.utils.cleaning import normalize_identifier
@@ -39,14 +40,23 @@ class MySQLService:
         query = text(f"SELECT * FROM `{safe_table}` LIMIT {int(limit)}")
         return pd.read_sql_query(query, self.engine)
 
-    def run_query(self, query: str) -> pd.DataFrame:
+    def run_query(self, query: str, parameters: dict[str, Any] | None = None) -> pd.DataFrame:
         self._ensure_configured()
-        return pd.read_sql_query(text(query), self.engine)
+        return pd.read_sql_query(text(query), self.engine, params=parameters)
+
+    def execute_statement(self, query: str, parameters: dict[str, Any] | list[dict[str, Any]] | None = None) -> int:
+        self._ensure_configured()
+        with self.engine.begin() as connection:
+            result = connection.execute(text(query), parameters or {})
+            return int(result.rowcount or 0)
 
     def describe_table(self, table_name: str) -> list[dict[str, Any]]:
         self._ensure_configured()
         inspector = inspect(self.engine)
-        columns = inspector.get_columns(normalize_identifier(table_name))
+        try:
+            columns = inspector.get_columns(normalize_identifier(table_name))
+        except NoSuchTableError:
+            return []
         rows = []
         for column in columns:
             rows.append(
@@ -58,7 +68,28 @@ class MySQLService:
             )
         return rows
 
+    def list_tables(self) -> list[str]:
+        self._ensure_configured()
+        inspector = inspect(self.engine)
+        return [normalize_identifier(table_name) for table_name in inspector.get_table_names()]
+
+    def get_schema_catalog(self) -> dict[str, list[str]]:
+        if not self.engine:
+            return {}
+
+        try:
+            inspector = inspect(self.engine)
+            catalog: dict[str, list[str]] = {}
+            for table_name in inspector.get_table_names():
+                try:
+                    columns = inspector.get_columns(table_name)
+                except NoSuchTableError:
+                    continue
+                catalog[normalize_identifier(table_name)] = [normalize_identifier(column["name"]) for column in columns]
+            return catalog
+        except Exception:
+            return {}
+
     def _ensure_configured(self) -> None:
         if not self.engine:
             raise RuntimeError("MySQL is not configured. Set MYSQL_USER and MYSQL_DATABASE in .env.")
-
