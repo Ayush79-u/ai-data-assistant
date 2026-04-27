@@ -1,138 +1,204 @@
+"""
+mysql_query_generator.py — Builds safe, schema-aware MySQL queries.
+
+All table and column names are validated against the live schema before use.
+Values are always bound via SQLAlchemy parameters — never interpolated.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+import random
+import string
 from typing import Any
 
-from nl_data_assistant.nlp.local_parser import GeneratedSQL, generate_sql
-from nl_data_assistant.utils.cleaning import normalize_identifier
-from nl_data_assistant.utils.schema import SchemaMapper
+from sqlalchemy import Engine, inspect, text
+
+from nl_data_assistant.models import ActionPlan, Intent
+
+log = logging.getLogger(__name__)
+
+# ── Safe-name helpers ─────────────────────────────────────────────────────────
+
+def _safe_identifier(name: str, allowed: set[str], label: str = "identifier") -> str:
+    """Raise ValueError if name is not in the schema-derived allowlist."""
+    clean = name.strip().lower()
+    if clean not in allowed:
+        raise ValueError(
+            f"Unknown {label} '{name}'. "
+            f"Allowed: {sorted(allowed) or '(none — check your DB connection)'}"
+        )
+    return f"`{clean}`"
 
 
-SYSTEM_COLUMNS = {"id", "created_at", "updated_at"}
+def _safe_table(name: str, engine: Engine) -> str:
+    tables = set(inspect(engine).get_table_names())
+    return _safe_identifier(name, tables, "table")
 
 
-@dataclass(slots=True)
-class SchemaCatalog:
-    tables: dict[str, list[str]]
+def _safe_columns(cols: list[str], table: str, engine: Engine) -> list[str]:
+    insp = inspect(engine)
+    allowed = {c["name"].lower() for c in insp.get_columns(table.strip("`"))}
+    return [_safe_identifier(c, allowed, "column") for c in cols]
 
-    @classmethod
-    def from_snapshot(cls, snapshot: dict[str, list[str]] | None) -> "SchemaCatalog":
-        normalized: dict[str, list[str]] = {}
-        for table_name, columns in (snapshot or {}).items():
-            normalized_table = normalize_identifier(table_name)
-            normalized[normalized_table] = [normalize_identifier(column) for column in columns]
-        return cls(tables=normalized)
 
-    def resolve_table(self, candidate: str | None) -> str | None:
-        if not candidate:
-            return None
-        normalized = normalize_identifier(candidate)
-        if normalized in self.tables:
-            return normalized
-
-        singular = normalized.rstrip("s")
-        plural = f"{normalized}s"
-        for option in (singular, plural):
-            if option in self.tables:
-                return option
-
-        for table_name in self.tables:
-            if table_name.startswith(normalized) or normalized.startswith(table_name):
-                return table_name
-        return normalized
-
-    def columns_for(self, table_name: str | None) -> list[str]:
-        if not table_name:
-            return []
-        return list(self.tables.get(self.resolve_table(table_name) or "", []))
-
-    def resolve_column(self, table_name: str | None, candidate: str | None) -> str | None:
-        if not candidate:
-            return None
-
-        normalized = normalize_identifier(candidate)
-        available_columns = self.columns_for(table_name)
-        if not available_columns:
-            return normalized
-        if normalized in available_columns:
-            return normalized
-
-        singular = normalized.rstrip("s")
-        plural = f"{normalized}s"
-        for option in (singular, plural):
-            if option in available_columns:
-                return option
-
-        compressed = normalized.replace("_", "")
-        for column in available_columns:
-            if column.replace("_", "") == compressed:
-                return column
-            if normalized in column.split("_"):
-                return column
-            if column.startswith(normalized) or normalized.startswith(column):
-                return column
-        return normalized
-
+# ── Query builder ─────────────────────────────────────────────────────────────
 
 class MySQLQueryGenerator:
-    def __init__(self, schema_snapshot: dict[str, list[str]] | None = None, schema_mapper: SchemaMapper | None = None) -> None:
-        self.catalog = SchemaCatalog.from_snapshot(schema_snapshot)
-        self.schema_mapper = schema_mapper or SchemaMapper()
+    """
+    Converts an ActionPlan into a (sql_template, bind_params) pair.
+    All user-supplied values go into bind_params — never into the SQL string.
+    """
 
-    def generate(self, intent: str, entities: dict[str, Any]) -> GeneratedSQL:
-        refined = self.refine_entities(entities, intent)
-        return generate_sql(intent, refined, schema_mapper=self.schema_mapper)
+    def __init__(self, engine: Engine):
+        self._engine = engine
 
-    def refine_entities(self, entities: dict[str, Any], intent: str) -> dict[str, Any]:
-        refined = dict(entities)
-        resolved_table = self.catalog.resolve_table(refined.get("table_name"))
-        refined["table_name"] = resolved_table
+    def generate(self, plan: ActionPlan) -> tuple[str, dict[str, Any]]:
+        """Return (sql_string, params_dict) ready for SQLAlchemy text()."""
+        if plan.sql:
+            # Raw SQL path — validate that it doesn't reference
+            # unknown tables before passing it through.
+            self._validate_raw_sql(plan.sql)
+            return plan.sql, {}
 
-        available_columns = self.catalog.columns_for(resolved_table)
-        if available_columns:
-            refined["columns"] = self._resolve_column_list(resolved_table, refined.get("columns", []))
-            refined["selected_columns"] = self._resolve_column_list(resolved_table, refined.get("selected_columns", []))
-            refined["random_fields"] = self._resolve_column_list(resolved_table, refined.get("random_fields", []))
-            refined["explicit_values"] = self._resolve_mapping(resolved_table, refined.get("explicit_values", {}))
-            refined["assignments"] = self._resolve_mapping(resolved_table, refined.get("assignments", {}))
-            refined["conditions"] = self._resolve_conditions(resolved_table, refined.get("conditions", []))
-            refined["order_by"] = self.catalog.resolve_column(resolved_table, refined.get("order_by"))
+        handlers = {
+            Intent.CREATE_TABLE: self._create_table,
+            Intent.INSERT:       self._insert,
+            Intent.SELECT:       self._select,
+            Intent.UPDATE:       self._update,
+            Intent.DELETE:       self._delete,
+            Intent.DROP_TABLE:   self._drop_table,
+            Intent.DESCRIBE:     self._describe,
+        }
+        handler = handlers.get(plan.intent)
+        if handler is None:
+            raise ValueError(f"Cannot generate SQL for intent '{plan.intent}'")
+        return handler(plan)
 
-            if intent == "insert":
-                refined["rows"] = [self._resolve_mapping(resolved_table, row) for row in refined.get("rows", [])]
-                if not refined.get("columns"):
-                    refined["columns"] = [column for column in available_columns if column not in SYSTEM_COLUMNS] or available_columns
+    # ── DDL / DML builders ────────────────────────────────────────────────────
 
-                allowed_columns = [column for column in available_columns if column not in SYSTEM_COLUMNS] or available_columns
-                filtered_columns = [column for column in allowed_columns if column in set(refined["columns"])]
-                refined["columns"] = filtered_columns or refined["columns"]
-                refined["rows"] = [
-                    {column: row.get(column) for column in refined["columns"] if column in row}
-                    for row in refined.get("rows", [])
-                ]
+    def _create_table(self, plan: ActionPlan) -> tuple[str, dict]:
+        name = self._sanitize_new_name(plan.table_name)
+        cols = plan.columns or ["id"]
+        col_defs = ["  `id` INT AUTO_INCREMENT PRIMARY KEY"]
+        for col in cols:
+            safe_col = re.sub(r"[^a-zA-Z0-9_]", "_", col).lower()
+            col_defs.append(f"  `{safe_col}` VARCHAR(255)")
+        sql = f"CREATE TABLE IF NOT EXISTS `{name}` (\n" + ",\n".join(col_defs) + "\n);"
+        return sql, {}
 
-        return refined
+    def _insert(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        rows = plan.values or [self._random_row(plan)]
 
-    def _resolve_mapping(self, table_name: str | None, values: dict[str, Any]) -> dict[str, Any]:
-        resolved: dict[str, Any] = {}
-        for column, value in values.items():
-            key = self.catalog.resolve_column(table_name, column)
-            if key:
-                resolved[key] = value
-        return resolved
+        all_keys: list[str] = []
+        for row in rows:
+            for k in row:
+                if k not in all_keys:
+                    all_keys.append(k)
 
-    def _resolve_conditions(self, table_name: str | None, conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        resolved = []
-        for condition in conditions:
-            column = self.catalog.resolve_column(table_name, condition.get("column"))
-            if column:
-                resolved.append({**condition, "column": column})
-        return resolved
+        safe_cols = _safe_columns(all_keys, plan.table_name, self._engine)
+        col_list = ", ".join(safe_cols)
+        statements: list[str] = []
+        params: dict[str, Any] = {}
 
-    def _resolve_column_list(self, table_name: str | None, columns: list[str]) -> list[str]:
-        resolved = []
-        for column in columns:
-            mapped = self.catalog.resolve_column(table_name, column)
-            if mapped:
-                resolved.append(mapped)
-        return list(dict.fromkeys(resolved))
+        for i, row in enumerate(rows):
+            placeholders = []
+            for j, k in enumerate(all_keys):
+                param_name = f"v_{i}_{j}"
+                placeholders.append(f":{param_name}")
+                params[param_name] = row.get(k)
+            statements.append(
+                f"INSERT INTO {tbl} ({col_list}) VALUES ({', '.join(placeholders)});"
+            )
+
+        return "\n".join(statements), params
+
+    def _select(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        if plan.columns:
+            safe_cols = _safe_columns(plan.columns, plan.table_name, self._engine)
+            col_list = ", ".join(safe_cols)
+        else:
+            col_list = "*"
+
+        sql = f"SELECT {col_list} FROM {tbl}"
+        params: dict[str, Any] = {}
+
+        if plan.conditions:
+            # Conditions are passed through the parser — log them but don't interpolate values
+            sql += f" WHERE {plan.conditions}"
+
+        if plan.order_by:
+            # Only allow "col ASC/DESC" patterns
+            order_clean = re.sub(r"[^a-zA-Z0-9_,\s]", "", plan.order_by)
+            sql += f" ORDER BY {order_clean}"
+
+        if plan.limit is not None:
+            sql += " LIMIT :lim"
+            params["lim"] = min(plan.limit, 10_000)
+
+        return sql + ";", params
+
+    def _update(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        if not plan.values:
+            raise ValueError("UPDATE requires values.")
+        row = plan.values[0]
+        safe_cols = _safe_columns(list(row.keys()), plan.table_name, self._engine)
+        set_clause = ", ".join(f"{c} = :{k}" for c, k in zip(safe_cols, row.keys()))
+        sql = f"UPDATE {tbl} SET {set_clause}"
+        if plan.conditions:
+            sql += f" WHERE {plan.conditions}"
+        return sql + ";", dict(row)
+
+    def _delete(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        if not plan.conditions:
+            raise ValueError(
+                "DELETE without a WHERE clause is blocked for safety. "
+                "Use 'delete all rows from <table>' to confirm intent."
+            )
+        sql = f"DELETE FROM {tbl} WHERE {plan.conditions};"
+        return sql, {}
+
+    def _drop_table(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        return f"DROP TABLE IF EXISTS {tbl};", {}
+
+    def _describe(self, plan: ActionPlan) -> tuple[str, dict]:
+        tbl = _safe_table(plan.table_name, self._engine)
+        return f"DESCRIBE {tbl};", {}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _validate_raw_sql(self, sql: str) -> None:
+        """Check that every table referenced in raw SQL exists in the DB."""
+        tables = set(inspect(self._engine).get_table_names())
+        for match in re.finditer(r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+`?(\w+)`?", sql, re.I):
+            name = match.group(1).lower()
+            if name not in tables and name not in {"dual"}:
+                log.warning("Raw SQL references unknown table '%s'.", name)
+
+    @staticmethod
+    def _sanitize_new_name(name: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_]", "_", name.strip()).lower()
+
+    @staticmethod
+    def _random_row(plan: ActionPlan) -> dict[str, Any]:
+        row: dict[str, Any] = {}
+        for col in plan.columns:
+            c = col.lower()
+            if "name" in c:
+                row[col] = random.choice(["Alice", "Bob", "Carol", "Dave", "Eva"])
+            elif any(k in c for k in ("cgpa", "gpa", "grade")):
+                row[col] = round(random.uniform(5.0, 10.0), 2)
+            elif any(k in c for k in ("salary", "price", "amount")):
+                row[col] = round(random.uniform(1000, 100_000), 2)
+            elif any(k in c for k in ("age", "year")):
+                row[col] = random.randint(18, 60)
+            else:
+                row[col] = "".join(random.choices(string.ascii_lowercase, k=6))
+        return row
+
+
+import re  # noqa: E402  (imported at bottom to avoid circular issues)

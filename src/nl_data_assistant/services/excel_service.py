@@ -1,45 +1,134 @@
+"""
+excel_service.py — Read, write, and inspect Excel workbooks.
+"""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
 
-from nl_data_assistant.models import ColumnSpec
+log = logging.getLogger(__name__)
+
+_EXCEL_ENGINE = "openpyxl"
 
 
 class ExcelService:
-    def create_sheet(self, workbook_path: str | Path, sheet_name: str, columns: list[ColumnSpec]) -> Path:
-        path = Path(workbook_path).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        headers = [column.name for column in columns] or ["id"]
-        dataframe = pd.DataFrame(columns=headers)
-        self.write_dataframe(path, dataframe, sheet_name=sheet_name)
-        return path
+    def __init__(self, default_path: Path | str | None = None):
+        self._default_path = Path(default_path) if default_path else None
 
-    def write_dataframe(self, workbook_path: str | Path, dataframe: pd.DataFrame, sheet_name: str) -> Path:
-        path = Path(workbook_path).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-                dataframe.to_excel(writer, index=False, sheet_name=sheet_name[:31] or "Sheet1")
-        else:
-            with pd.ExcelWriter(path, engine="openpyxl", mode="w") as writer:
-                dataframe.to_excel(writer, index=False, sheet_name=sheet_name[:31] or "Sheet1")
-        return path
+    # ── Read ──────────────────────────────────────────────────────────────────
 
-    def read_sheet(self, workbook_path: str | Path, sheet_name: str | int | None = None) -> pd.DataFrame:
-        path = Path(workbook_path).resolve()
-        selected_sheet = 0 if sheet_name in (None, "") else sheet_name
-        return pd.read_excel(path, sheet_name=selected_sheet)
+    def read_sheet(
+        self,
+        path: Path | str | None = None,
+        sheet: str | int = 0,
+    ) -> pd.DataFrame:
+        p = self._resolve(path)
+        df = pd.read_excel(p, sheet_name=sheet, engine=_EXCEL_ENGINE)
+        return self._clean_headers(df)
 
-    def list_sheets(self, workbook_path: str | Path) -> list[str]:
-        workbook = pd.ExcelFile(Path(workbook_path).resolve())
-        return workbook.sheet_names
+    def list_sheets(self, path: Path | str | None = None) -> list[str]:
+        p = self._resolve(path)
+        xl = pd.ExcelFile(p, engine=_EXCEL_ENGINE)
+        return xl.sheet_names
 
-    def describe_sheet(self, workbook_path: str | Path, sheet_name: str | int | None = None) -> list[dict[str, str]]:
-        dataframe = self.read_sheet(workbook_path, sheet_name=sheet_name)
-        rows = []
-        for name, dtype in dataframe.dtypes.items():
-            rows.append({"column": str(name), "dtype": str(dtype)})
-        return rows
+    def read_all_sheets(self, path: Path | str | None = None) -> dict[str, pd.DataFrame]:
+        p = self._resolve(path)
+        xl = pd.ExcelFile(p, engine=_EXCEL_ENGINE)
+        return {
+            name: self._clean_headers(xl.parse(name))
+            for name in xl.sheet_names
+        }
 
+    # ── Write ─────────────────────────────────────────────────────────────────
+
+    def write_sheet(
+        self,
+        df: pd.DataFrame,
+        path: Path | str | None = None,
+        sheet: str = "Sheet1",
+        mode: str = "w",
+    ) -> Path:
+        """Write a DataFrame to a sheet. mode='a' appends without overwriting others."""
+        p = self._resolve(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        kw = {"if_sheet_exists": "replace"} if mode == "a" and p.exists() else {}
+        with pd.ExcelWriter(p, engine=_EXCEL_ENGINE, mode=mode, **kw) as writer:
+            df.to_excel(writer, sheet_name=sheet, index=False)
+        log.info("Wrote %d rows to %s[%s]", len(df), p, sheet)
+        return p
+
+    def create_blank(
+        self,
+        columns: list[str],
+        path: Path | str | None = None,
+        sheet: str = "Sheet1",
+    ) -> Path:
+        df = pd.DataFrame(columns=columns)
+        return self.write_sheet(df, path, sheet)
+
+    # ── Schema ────────────────────────────────────────────────────────────────
+
+    def infer_schema(self, path: Path | str | None = None, sheet: str | int = 0) -> dict:
+        """Return column names and inferred MySQL types."""
+        df = self.read_sheet(path, sheet)
+        return {col: _infer_mysql_type(df[col]) for col in df.columns}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _resolve(self, path: Path | str | None) -> Path:
+        p = path or self._default_path
+        if p is None:
+            raise ValueError("No Excel file path provided.")
+        return Path(p)
+
+    @staticmethod
+    def _clean_headers(df: pd.DataFrame) -> pd.DataFrame:
+        df.columns = (
+            df.columns.astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(r"[\s\-/]+", "_", regex=True)
+            .str.replace(r"[^a-z0-9_]", "", regex=True)
+        )
+        # Drop completely empty rows and columns
+        df = df.dropna(how="all").dropna(axis=1, how="all")
+        return df.reset_index(drop=True)
+
+
+# ── Type inference ────────────────────────────────────────────────────────────
+
+def _infer_mysql_type(series: pd.Series) -> str:
+    """Infer a MySQL column type from the full column, not just the first row."""
+    s = series.dropna()
+    if s.empty:
+        return "VARCHAR(255)"
+
+    if pd.api.types.is_bool_dtype(s):
+        return "TINYINT(1)"
+    if pd.api.types.is_integer_dtype(s):
+        mx = s.abs().max()
+        if mx <= 127:
+            return "TINYINT"
+        if mx <= 32_767:
+            return "SMALLINT"
+        if mx <= 2_147_483_647:
+            return "INT"
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(s):
+        return "DECIMAL(15,4)"
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "DATETIME"
+
+    # Try parsing as datetime
+    try:
+        pd.to_datetime(s, infer_datetime_format=True)
+        return "DATE"
+    except (ValueError, TypeError):
+        pass
+
+    max_len = int(s.astype(str).str.len().max())
+    if max_len > 255:
+        return "TEXT"
+    return f"VARCHAR({min(max_len * 2 + 10, 255)})"

@@ -1,185 +1,274 @@
 """
-mysql_service.py – Improved MySQLService
-Key changes vs original:
-  • Tables always get an AUTO_INCREMENT primary key (`_id`) injected
-  • write_dataframe() uses INSERT IGNORE to block duplicate rows
-  • execute_statement() accepts both dict and list[dict] parameters
-  • describe_table() / get_schema_catalog() are fully exception-safe
-  • New helper: table_exists() used by the engine before DDL
+mysql_service.py — All MySQL I/O via SQLAlchemy.
+Queries are always executed with bound parameters — never raw f-strings.
 """
-
 from __future__ import annotations
 
-from typing import Any
+import logging
+import re
+from contextlib import contextmanager
+from typing import Any, Generator
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import NoSuchTableError, OperationalError
+from sqlalchemy import Engine, create_engine, inspect, text
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
-from nl_data_assistant.models import ColumnSpec
-from nl_data_assistant.utils.cleaning import normalize_identifier
+from nl_data_assistant.config import settings
+from nl_data_assistant.models import ActionPlan, ExecutionResult
+from nl_data_assistant.nlp.mysql_query_generator import MySQLQueryGenerator
+
+log = logging.getLogger(__name__)
+
+_ALLOWED_SQL_TYPES = {
+    "INT",
+    "BIGINT",
+    "FLOAT",
+    "DOUBLE",
+    "DECIMAL(10,2)",
+    "VARCHAR(255)",
+    "TEXT",
+    "DATETIME",
+    "DATE",
+    "TINYINT(1)",
+    "INT AUTO_INCREMENT",
+}
 
 
-_AUTO_PK = "`_id` INT AUTO_INCREMENT PRIMARY KEY"
+def _sanitize_identifier(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
+    if not cleaned:
+        raise ValueError("A table or column name is required.")
+    return cleaned
+
+
+def _normalise_sql_type(value: str) -> str:
+    sql_type = value.strip().upper()
+    if sql_type not in _ALLOWED_SQL_TYPES:
+        raise ValueError(
+            f"Unsupported SQL type '{value}'. Allowed types: {sorted(_ALLOWED_SQL_TYPES)}"
+        )
+    return sql_type
 
 
 class MySQLService:
-    def __init__(self, database_url: str | None) -> None:
-        self.database_url = database_url
-        self.engine = create_engine(database_url, future=True, pool_pre_ping=True) if database_url else None
+    def __init__(self, engine: Engine | None = None):
+        self._engine = engine or create_engine(
+            settings.mysql_url,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
+        self._generator = MySQLQueryGenerator(self._engine)
 
-    # ------------------------------------------------------------------ #
-    # Properties                                                           #
-    # ------------------------------------------------------------------ #
+    # ── Connection check ──────────────────────────────────────────────────────
 
-    @property
-    def is_configured(self) -> bool:
-        return self.engine is not None
+    def ping(self) -> bool:
+        """Return True if the DB is reachable."""
+        try:
+            with self._engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except OperationalError:
+            return False
 
-    # ------------------------------------------------------------------ #
-    # DDL helpers                                                          #
-    # ------------------------------------------------------------------ #
+    # ── Schema introspection ──────────────────────────────────────────────────
+
+    def get_table_names(self) -> list[str]:
+        return inspect(self._engine).get_table_names()
 
     def table_exists(self, table_name: str) -> bool:
-        """Return True when the table is already present in the database."""
-        if not self.engine:
-            return False
-        try:
-            return normalize_identifier(table_name) in inspect(self.engine).get_table_names()
-        except Exception:
-            return False
+        safe_name = _sanitize_identifier(table_name)
+        return safe_name in {name.lower() for name in self.get_table_names()}
 
-    def create_table(self, table_name: str, columns: list[ColumnSpec]) -> None:
-        """
-        CREATE TABLE IF NOT EXISTS with an injected AUTO_INCREMENT primary key.
+    def get_table_columns(self, table_name: str) -> list[dict[str, Any]]:
+        safe_name = self._validate_existing_table(table_name)
+        return inspect(self._engine).get_columns(safe_name)
 
-        Why AUTO_INCREMENT?
-        – Every table needs a stable unique row identity so that future
-          UPDATE / DELETE commands can target specific rows safely.
-        – Without it, duplicate inserts are hard to detect and remove.
-        """
-        self._ensure_configured()
-        safe_table = normalize_identifier(table_name)
-
-        user_cols = ", ".join(
-            f"`{normalize_identifier(c.name)}` {c.data_type} {'NULL' if c.nullable else 'NOT NULL'}"
-            for c in columns
-        )
-        # Prepend the hidden PK; skip if caller already included one.
-        pk_clause = _AUTO_PK if not any(c.name.lower() in ("id", "_id") for c in columns) else ""
-        col_block = f"{pk_clause}, {user_cols}" if pk_clause else user_cols
-
-        ddl = f"CREATE TABLE IF NOT EXISTS `{safe_table}` ({col_block})"
-        with self.engine.begin() as conn:
-            conn.execute(text(ddl))
-
-    # ------------------------------------------------------------------ #
-    # DML helpers                                                          #
-    # ------------------------------------------------------------------ #
-
-    def write_dataframe(
-        self,
-        dataframe: pd.DataFrame,
-        table_name: str,
-        if_exists: str = "append",
-        ignore_duplicates: bool = True,
-    ) -> int:
-        """
-        Persist a DataFrame to MySQL.
-
-        ignore_duplicates=True  → uses INSERT IGNORE, so rows whose unique /
-        primary-key constraints collide are silently skipped rather than
-        raising an error.  This is the primary guard against Streamlit-rerun
-        duplicate inserts.
-
-        Why do reruns cause duplicates?
-        Streamlit re-executes the *entire* script on every widget interaction
-        or st.rerun() call.  If a DB write sits outside of a proper
-        session_state guard it runs again each time, inserting the same rows.
-        INSERT IGNORE is the last line of defence; the real fix is the
-        command-hash guard in streamlit_app.py.
-        """
-        self._ensure_configured()
-        safe = normalize_identifier(table_name)
-
-        if ignore_duplicates and if_exists == "append":
-            # Build INSERT IGNORE manually so duplicates are skipped at the DB level.
-            cols = ", ".join(f"`{c}`" for c in dataframe.columns)
-            placeholders = ", ".join(f":{c}" for c in dataframe.columns)
-            stmt = text(f"INSERT IGNORE INTO `{safe}` ({cols}) VALUES ({placeholders})")
-            with self.engine.begin() as conn:
-                rows = dataframe.to_dict(orient="records")
-                result = conn.execute(stmt, rows)
-                return int(result.rowcount or 0)
-
-        dataframe.to_sql(safe, self.engine, if_exists=if_exists, index=False)
-        return len(dataframe)
-
-    def read_table(self, table_name: str, limit: int = 500) -> pd.DataFrame:
-        self._ensure_configured()
-        safe = normalize_identifier(table_name)
-        return pd.read_sql_query(text(f"SELECT * FROM `{safe}` LIMIT {int(limit)}"), self.engine)
-
-    def run_query(self, query: str, parameters: dict[str, Any] | None = None) -> pd.DataFrame:
-        self._ensure_configured()
-        return pd.read_sql_query(text(query), self.engine, params=parameters)
-
-    def execute_statement(
-        self,
-        query: str,
-        parameters: dict[str, Any] | list[dict[str, Any]] | None = None,
-    ) -> int:
-        self._ensure_configured()
-        with self.engine.begin() as conn:
-            result = conn.execute(text(query), parameters or {})
-            return int(result.rowcount or 0)
-
-    # ------------------------------------------------------------------ #
-    # Introspection                                                        #
-    # ------------------------------------------------------------------ #
-
-    def describe_table(self, table_name: str) -> list[dict[str, Any]]:
-        self._ensure_configured()
-        try:
-            cols = inspect(self.engine).get_columns(normalize_identifier(table_name))
-        except (NoSuchTableError, OperationalError):
-            return []
-        return [
-            {"column": c["name"], "dtype": str(c["type"]), "nullable": bool(c.get("nullable", True))}
-            for c in cols
-        ]
-
-    def list_tables(self) -> list[str]:
-        """Return all table names in the connected database."""
-        if not self.engine:
-            return []
-        try:
-            return [normalize_identifier(t) for t in inspect(self.engine).get_table_names()]
-        except Exception:
-            return []
-
-    def get_schema_catalog(self) -> dict[str, list[str]]:
-        if not self.engine:
-            return {}
-        try:
-            inspector = inspect(self.engine)
-            catalog: dict[str, list[str]] = {}
-            for tbl in inspector.get_table_names():
-                try:
-                    cols = inspector.get_columns(tbl)
-                    catalog[normalize_identifier(tbl)] = [normalize_identifier(c["name"]) for c in cols]
-                except NoSuchTableError:
-                    continue
-            return catalog
-        except Exception:
-            return {}
-
-    # ------------------------------------------------------------------ #
-    # Internal                                                             #
-    # ------------------------------------------------------------------ #
-
-    def _ensure_configured(self) -> None:
-        if not self.engine:
-            raise RuntimeError(
-                "MySQL is not configured. Set MYSQL_USER and MYSQL_DATABASE in your .env file."
+    def get_schema_summary(self) -> str:
+        """Return a compact schema string for local parser context and debugging."""
+        insp = inspect(self._engine)
+        parts: list[str] = []
+        for table in insp.get_table_names():
+            cols = ", ".join(
+                f"{c['name']} {c['type']}" for c in insp.get_columns(table)
             )
+            parts.append(f"{table}({cols})")
+        return "tables: " + "; ".join(parts) if parts else "(no tables yet)"
+
+    def fetch_table(self, table_name: str, limit: int = 500) -> pd.DataFrame:
+        safe_name = self._validate_existing_table(table_name)
+        sql = f"SELECT * FROM `{safe_name}` LIMIT :limit;"
+        with self._engine.begin() as conn:
+            result = conn.execute(text(sql), {"limit": max(1, min(limit, 10_000))})
+            rows = result.fetchall()
+            columns = list(result.keys())
+        return pd.DataFrame(rows, columns=columns)
+
+    def create_table_from_blueprint(
+        self,
+        blueprint: dict[str, Any],
+        *,
+        recreate: bool = False,
+    ) -> ExecutionResult:
+        try:
+            table_name = _sanitize_identifier(str(blueprint.get("table_name", "")))
+            columns = blueprint.get("columns") or []
+            if not columns:
+                raise ValueError("The blueprint does not contain any columns.")
+
+            sql = self._build_create_table_sql(table_name, columns)
+            statements: list[str] = []
+
+            with self._engine.begin() as conn:
+                if recreate:
+                    conn.execute(text(f"DROP TABLE IF EXISTS `{table_name}`;"))
+                    statements.append(f"DROP TABLE IF EXISTS `{table_name}`;")
+                conn.execute(text(sql))
+                statements.append(sql)
+
+            return ExecutionResult(
+                success=True,
+                sql_executed="\n".join(statements),
+                message=f"Created table `{table_name}`.",
+            )
+        except (ValueError, SQLAlchemyError) as exc:
+            log.error("Create table failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
+    def replace_table_data(self, table_name: str, df: pd.DataFrame) -> ExecutionResult:
+        try:
+            safe_name = self._validate_existing_table(table_name)
+            db_columns = self.get_table_columns(safe_name)
+            if not db_columns:
+                raise ValueError(f"Table '{safe_name}' has no columns.")
+
+            writable_columns: list[str] = []
+            for column in db_columns:
+                column_name = column["name"]
+                autoincrement_value = str(column.get("autoincrement", "")).lower()
+                is_auto_id = column_name.lower() == "id" and (
+                    column.get("primary_key")
+                    or autoincrement_value in {"true", "auto", "auto_increment"}
+                    or "auto_increment" in autoincrement_value
+                )
+                if is_auto_id:
+                    continue
+                writable_columns.append(column_name)
+
+            clean_df = df.copy()
+            clean_df.columns = [str(col).strip() for col in clean_df.columns]
+
+            missing = [name for name in writable_columns if name not in clean_df.columns]
+            for column_name in missing:
+                clean_df[column_name] = None
+
+            extra_columns = [name for name in clean_df.columns if name not in writable_columns]
+            if extra_columns:
+                clean_df = clean_df.drop(columns=extra_columns)
+
+            clean_df = clean_df[writable_columns]
+            clean_df = clean_df.where(pd.notnull(clean_df), None)
+
+            delete_sql = f"DELETE FROM `{safe_name}`;"
+            statements = [delete_sql]
+
+            with self._engine.begin() as conn:
+                conn.execute(text(delete_sql))
+                if not clean_df.empty and writable_columns:
+                    column_sql = ", ".join(f"`{name}`" for name in writable_columns)
+                    value_sql = ", ".join(f":{name}" for name in writable_columns)
+                    insert_sql = f"INSERT INTO `{safe_name}` ({column_sql}) VALUES ({value_sql});"
+                    conn.execute(text(insert_sql), clean_df.to_dict(orient="records"))
+                    statements.append(insert_sql)
+
+            return ExecutionResult(
+                success=True,
+                sql_executed="\n".join(statements),
+                rows_affected=len(clean_df),
+                message=f"Saved {len(clean_df)} row(s) to `{safe_name}`.",
+            )
+        except (ValueError, SQLAlchemyError) as exc:
+            log.error("Save table data failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
+    # ── Query execution ───────────────────────────────────────────────────────
+
+    def execute_plan(self, plan: ActionPlan) -> ExecutionResult:
+        try:
+            sql, params = self._generator.generate(plan)
+            return self._run(sql, params)
+        except ValueError as exc:
+            return ExecutionResult(success=False, error=str(exc))
+        except SQLAlchemyError as exc:
+            log.error("DB error: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
+    def execute_raw(self, sql: str, params: dict[str, Any] | None = None) -> ExecutionResult:
+        """Execute arbitrary SQL — caller is responsible for safety checks."""
+        try:
+            return self._run(sql, params or {})
+        except SQLAlchemyError as exc:
+            log.error("Raw SQL execution failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc), sql_executed=sql)
+
+    def _run(self, sql: str, params: dict[str, Any]) -> ExecutionResult:
+        normalized = sql.strip().upper()
+        is_select = normalized.startswith("SELECT") or normalized.startswith("DESCRIBE")
+        with self._engine.begin() as conn:
+            result = conn.execute(text(sql), params)
+            if is_select:
+                rows = result.fetchall()
+                columns = list(result.keys())
+                df = pd.DataFrame(rows, columns=columns)
+                return ExecutionResult(
+                    success=True,
+                    data=df,
+                    sql_executed=sql,
+                    rows_affected=len(df),
+                    message=f"Returned {len(df)} row(s).",
+                )
+            else:
+                return ExecutionResult(
+                    success=True,
+                    sql_executed=sql,
+                    rows_affected=result.rowcount,
+                    message=f"OK — {result.rowcount} row(s) affected.",
+                )
+
+    # ── Context manager support ───────────────────────────────────────────────
+
+    def _validate_existing_table(self, table_name: str) -> str:
+        safe_name = _sanitize_identifier(table_name)
+        tables = {name.lower(): name for name in self.get_table_names()}
+        if safe_name not in tables:
+            raise ValueError(f"Unknown table '{table_name}'.")
+        return tables[safe_name]
+
+    def _build_create_table_sql(self, table_name: str, columns: list[dict[str, Any]]) -> str:
+        column_lines: list[str] = []
+        primary_key_columns: list[str] = []
+
+        for column in columns:
+            column_name = _sanitize_identifier(str(column.get("name", "")))
+            column_type = _normalise_sql_type(str(column.get("type", "VARCHAR(255)")))
+            is_primary = bool(column.get("primary_key", False))
+            line = f"`{column_name}` {column_type}"
+            if is_primary and "AUTO_INCREMENT" not in column_type:
+                line += " NOT NULL"
+            column_lines.append(line)
+            if is_primary:
+                primary_key_columns.append(column_name)
+
+        if primary_key_columns:
+            joined_keys = ", ".join(f"`{name}`" for name in primary_key_columns)
+            column_lines.append(f"PRIMARY KEY ({joined_keys})")
+
+        return (
+            f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n  "
+            + ",\n  ".join(column_lines)
+            + "\n);"
+        )
+
+    @contextmanager
+    def transaction(self) -> Generator:
+        with self._engine.begin() as conn:
+            yield conn

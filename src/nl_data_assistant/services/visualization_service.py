@@ -1,99 +1,143 @@
+"""
+visualization_service.py — Plotly chart generation from DataFrames.
+"""
 from __future__ import annotations
 
-from pathlib import Path
+import logging
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from nl_data_assistant.utils.cleaning import normalize_identifier
+log = logging.getLogger(__name__)
+
+_TEMPLATE = "plotly_white"
+_PALETTE = px.colors.qualitative.Set2
+
+# Map chart-type aliases to canonical names
+_ALIASES: dict[str, str] = {
+    "bar": "bar", "column": "bar",
+    "line": "line", "trend": "line",
+    "pie": "pie", "donut": "pie",
+    "scatter": "scatter", "dot": "scatter",
+    "hist": "histogram", "histogram": "histogram",
+    "dashboard": "dashboard",
+}
 
 
 class VisualizationService:
-    def create_chart(
+    def plot(
         self,
-        dataframe: pd.DataFrame,
-        chart_type: str,
-        output_dir: str | Path,
-        x_column: str | None = None,
-        y_column: str | None = None,
-        title: str | None = None,
-    ) -> tuple[go.Figure, Path, dict[str, str | None]]:
-        if dataframe.empty:
-            raise ValueError("There is no data available to visualize.")
+        df: pd.DataFrame,
+        chart_type: str = "bar",
+        title: str = "",
+    ) -> go.Figure:
+        """
+        Auto-pick X / Y axes from the DataFrame and return a Plotly figure.
+        """
+        if df is None or df.empty:
+            return self._empty_fig("No data to display.")
 
-        chart_type = (chart_type or "bar").lower()
-        x_column, y_column = self._infer_axes(dataframe, chart_type, x_column, y_column)
+        chart = _ALIASES.get(chart_type.lower(), "bar")
+        x_col, y_col = self._pick_axes(df)
 
-        if chart_type == "bar":
-            figure = px.bar(dataframe, x=x_column, y=y_column, title=title or "Bar Chart")
-        elif chart_type == "line":
-            figure = px.line(dataframe, x=x_column, y=y_column, title=title or "Line Chart")
-        elif chart_type == "pie":
-            figure = px.pie(dataframe, names=x_column, values=y_column, title=title or "Pie Chart")
-        elif chart_type == "scatter":
-            figure = px.scatter(dataframe, x=x_column, y=y_column, title=title or "Scatter Plot")
-        elif chart_type == "histogram":
-            figure = px.histogram(dataframe, x=x_column, title=title or "Histogram")
-        elif chart_type == "dashboard":
-            figure = self._build_dashboard(dataframe, title=title or "Dashboard")
-        else:
-            figure = px.bar(dataframe, x=x_column, y=y_column, title=title or "Chart")
+        try:
+            if chart == "bar":
+                fig = px.bar(df, x=x_col, y=y_col, title=title,
+                             color=x_col, color_discrete_sequence=_PALETTE)
+            elif chart == "line":
+                fig = px.line(df, x=x_col, y=y_col, title=title, markers=True)
+            elif chart == "pie":
+                fig = px.pie(df, names=x_col, values=y_col, title=title,
+                             color_discrete_sequence=_PALETTE)
+            elif chart == "scatter":
+                fig = px.scatter(df, x=x_col, y=y_col, title=title,
+                                 trendline="ols" if len(df) > 5 else None)
+            elif chart == "histogram":
+                fig = px.histogram(df, x=y_col, title=title,
+                                   nbins=min(30, max(5, len(df) // 5)))
+            elif chart == "dashboard":
+                return self.dashboard(df, title)
+            else:
+                fig = px.bar(df, x=x_col, y=y_col, title=title)
 
-        output_path = Path(output_dir).resolve() / f"{normalize_identifier(title or chart_type)}.html"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        figure.write_html(output_path)
-        return figure, output_path, {"x_column": x_column, "y_column": y_column}
+        except Exception as exc:
+            log.warning("Chart error (%s), falling back to table view.", exc)
+            return self._table_fig(df, title)
 
-    def _infer_axes(
-        self,
-        dataframe: pd.DataFrame,
-        chart_type: str,
-        x_column: str | None,
-        y_column: str | None,
-    ) -> tuple[str | None, str | None]:
-        numeric_columns = dataframe.select_dtypes(include="number").columns.tolist()
-        non_numeric_columns = [column for column in dataframe.columns if column not in numeric_columns]
+        fig.update_layout(
+            template=_TEMPLATE,
+            title_font_size=16,
+            legend_title_text="",
+            margin={"t": 60, "b": 40, "l": 40, "r": 20},
+        )
+        return fig
 
-        if chart_type == "histogram":
-            return x_column or (numeric_columns[0] if numeric_columns else dataframe.columns[0]), y_column
+    def dashboard(self, df: pd.DataFrame, title: str = "Dashboard") -> go.Figure:
+        """Multi-panel dashboard: bar + line + histogram of all numeric cols."""
+        num_cols = df.select_dtypes("number").columns.tolist()
+        cat_cols = df.select_dtypes(exclude="number").columns.tolist()
 
-        inferred_x = x_column or (non_numeric_columns[0] if non_numeric_columns else dataframe.columns[0])
-        inferred_y = y_column or (numeric_columns[0] if numeric_columns else None)
+        if not num_cols:
+            return self._empty_fig("No numeric columns for dashboard.")
 
-        if inferred_y is None and len(dataframe.columns) > 1:
-            inferred_y = dataframe.columns[1]
-
-        return inferred_x, inferred_y
-
-    def _build_dashboard(self, dataframe: pd.DataFrame, title: str) -> go.Figure:
-        numeric_columns = dataframe.select_dtypes(include="number").columns.tolist()
-        category_columns = [column for column in dataframe.columns if column not in numeric_columns]
-
-        figure = make_subplots(
-            rows=2,
-            cols=2,
-            specs=[[{"type": "indicator"}, {"type": "histogram"}], [{"type": "bar"}, {"type": "box"}]],
-            subplot_titles=("Row Count", "Distribution", "Top Categories", "Spread"),
+        rows, cols_count = 2, 2
+        fig = make_subplots(
+            rows=rows, cols=cols_count,
+            subplot_titles=["Distribution", "Trend", "Histogram", "Summary"],
         )
 
-        figure.add_trace(
-            go.Indicator(mode="number", value=len(dataframe), title={"text": "Rows"}),
-            row=1,
-            col=1,
+        x = cat_cols[0] if cat_cols else df.index.astype(str)
+        y = num_cols[0]
+
+        fig.add_trace(go.Bar(x=df[x], y=df[y], name=y, marker_color="#4C78A8"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df[x], y=df[y], mode="lines+markers", name=y), row=1, col=2)
+        fig.add_trace(go.Histogram(x=df[y], name=y, marker_color="#72B7B2"), row=2, col=1)
+
+        if len(num_cols) >= 2:
+            fig.add_trace(go.Scatter(
+                x=df[num_cols[0]], y=df[num_cols[1]],
+                mode="markers", name=f"{num_cols[0]} vs {num_cols[1]}",
+            ), row=2, col=2)
+
+        fig.update_layout(
+            title_text=title,
+            template=_TEMPLATE,
+            showlegend=False,
+            height=600,
         )
+        return fig
 
-        if numeric_columns:
-            main_numeric = numeric_columns[0]
-            figure.add_trace(go.Histogram(x=dataframe[main_numeric], name=main_numeric), row=1, col=2)
-            figure.add_trace(go.Box(y=dataframe[main_numeric], name=main_numeric), row=2, col=2)
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-        if category_columns:
-            main_category = category_columns[0]
-            counts = dataframe[main_category].astype(str).value_counts().head(10)
-            figure.add_trace(go.Bar(x=counts.index, y=counts.values, name=main_category), row=2, col=1)
+    @staticmethod
+    def _pick_axes(df: pd.DataFrame) -> tuple[str, str]:
+        """Heuristically pick the best X (categorical) and Y (numeric) columns."""
+        num_cols = df.select_dtypes("number").columns.tolist()
+        cat_cols = df.select_dtypes(exclude="number").columns.tolist()
 
-        figure.update_layout(height=700, title=title, showlegend=False)
-        return figure
+        y_col = num_cols[0] if num_cols else df.columns[-1]
+        x_col = cat_cols[0] if cat_cols else (
+            num_cols[1] if len(num_cols) > 1 else df.columns[0]
+        )
+        return x_col, y_col
 
+    @staticmethod
+    def _empty_fig(message: str) -> go.Figure:
+        fig = go.Figure()
+        fig.add_annotation(text=message, x=0.5, y=0.5, showarrow=False,
+                           font={"size": 16}, xref="paper", yref="paper")
+        fig.update_layout(template=_TEMPLATE)
+        return fig
+
+    @staticmethod
+    def _table_fig(df: pd.DataFrame, title: str) -> go.Figure:
+        fig = go.Figure(data=[go.Table(
+            header={"values": list(df.columns), "fill_color": "#4C78A8",
+                    "font": {"color": "white"}, "align": "left"},
+            cells={"values": [df[c].tolist() for c in df.columns],
+                   "fill_color": "lavender", "align": "left"},
+        )])
+        fig.update_layout(title_text=title, template=_TEMPLATE)
+        return fig

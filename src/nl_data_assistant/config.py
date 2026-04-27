@@ -1,3 +1,7 @@
+"""
+config.py — centralised settings loaded from .env.
+"""
+
 from __future__ import annotations
 
 import os
@@ -7,69 +11,65 @@ from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
-
+# Load .env
 load_dotenv()
 
+_REQUIRED_MYSQL = ["MYSQL_HOST", "MYSQL_USER"]
 
-@dataclass(slots=True)
-class AppConfig:
-    base_dir: Path
-    data_dir: Path
-    upload_dir: Path
-    output_dir: Path
-    default_workbook: Path
-    default_target: str
-    mysql_host: str
-    mysql_port: int
-    mysql_user: str
-    mysql_password: str
-    mysql_database: str
-    openai_api_key: str
-    openai_model: str
 
-    @classmethod
-    def from_env(cls, base_dir: str | Path | None = None) -> "AppConfig":
-        resolved_base = Path(base_dir or Path.cwd()).resolve()
-        data_dir = resolved_base / "data"
-        upload_dir = data_dir / "uploads"
-        output_dir = resolved_base / "outputs"
-        default_workbook = resolved_base / os.getenv("DEFAULT_WORKBOOK", "data/workbook.xlsx")
-
-        config = cls(
-            base_dir=resolved_base,
-            data_dir=data_dir,
-            upload_dir=upload_dir,
-            output_dir=output_dir,
-            default_workbook=default_workbook,
-            default_target=os.getenv("DEFAULT_TARGET", "mysql").strip().lower() or "mysql",
-            mysql_host=os.getenv("MYSQL_HOST", "localhost").strip(),
-            mysql_port=int(os.getenv("MYSQL_PORT", "3306")),
-            mysql_user=os.getenv("MYSQL_USER", "").strip(),
-            mysql_password=os.getenv("MYSQL_PASSWORD", ""),
-            mysql_database=os.getenv("MYSQL_DATABASE", "").strip(),
-            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            openai_model=os.getenv("OPENAI_MODEL", "").strip(),
+def validate_config() -> None:
+    """Raise EnvironmentError at startup if critical keys are missing."""
+    missing = [k for k in _REQUIRED_MYSQL if not os.getenv(k)]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required .env variables: {missing}\n"
+            "Copy .env.example to .env and fill in your MySQL credentials."
         )
-        config.ensure_directories()
-        return config
 
-    def ensure_directories(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.default_workbook.parent.mkdir(parents=True, exist_ok=True)
+
+@dataclass(frozen=True)
+class Settings:
+    # 🔥 Use 127.0.0.1 instead of localhost (more reliable)
+    mysql_host: str = os.getenv("MYSQL_HOST", "127.0.0.1")
+    mysql_port: int = int(os.getenv("MYSQL_PORT", "3306"))
+    mysql_user: str = os.getenv("MYSQL_USER", "root")
+    mysql_password: str = os.getenv("MYSQL_PASSWORD", "")
+    mysql_database: str = os.getenv("MYSQL_DATABASE", "ai_data_assistant")
+
+    default_target: str = os.getenv("DEFAULT_TARGET", "mysql")
+    default_workbook: Path = Path(
+        os.getenv("DEFAULT_WORKBOOK", "data/workbook.xlsx")
+    )
 
     @property
-    def mysql_url(self) -> str | None:
-        if not (self.mysql_user and self.mysql_database):
-            return None
-        password = quote_plus(self.mysql_password)
+    def default_database(self) -> str:
+        return self.mysql_database.strip()
+
+    @property
+    def mysql_server_url(self) -> str:
+        """
+        Build safe MySQL connection URL.
+        Handles special characters in password (like @, :, /, etc.)
+        """
+        encoded_password = quote_plus(self.mysql_password)  # 🔥 CRITICAL FIX
+
         return (
-            f"mysql+pymysql://{self.mysql_user}:{password}"
-            f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
+            f"mysql+pymysql://{self.mysql_user}:{encoded_password}"
+            f"@{self.mysql_host}:{self.mysql_port}"
+            "?charset=utf8mb4"
         )
 
-    @property
-    def llm_enabled(self) -> bool:
-        return bool(self.openai_api_key and self.openai_model)
+    def mysql_url_for(self, database: str | None = None) -> str:
+        target_database = (database if database is not None else self.default_database).strip()
+        base = self.mysql_server_url.removesuffix("?charset=utf8mb4")
+        if target_database:
+            return f"{base}/{target_database}?charset=utf8mb4"
+        return self.mysql_server_url
 
+    @property
+    def mysql_url(self) -> str:
+        return self.mysql_url_for()
+
+
+# Singleton settings object
+settings = Settings()

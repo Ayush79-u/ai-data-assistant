@@ -1,50 +1,53 @@
+"""
+api_models.py — Pydantic request / response schemas for the FastAPI layer.
+"""
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class CommandRequest(BaseModel):
-    command: str = Field(..., min_length=1)
-    target: Literal["auto", "excel", "mysql"] = "auto"
-    uploaded_file_path: str | None = None
+# ── Requests ──────────────────────────────────────────────────────────────────
+
+class RunRequest(BaseModel):
+    command: str = Field(..., min_length=1, description="Natural-language command")
+    skip_confirmation: bool = Field(
+        False,
+        description="Set to True to execute destructive ops without a confirmation round-trip.",
+    )
+
+
+class ExecuteRequest(BaseModel):
+    """Execute a pre-parsed plan — use the output of /parse."""
+    intent: str
+    table_name: str = ""
+    columns: list[str] = []
+    values: list[dict[str, Any]] = []
+    conditions: str = ""
+    sql: str = ""
+    raw_command: str = ""
 
 
 class BlueprintRequest(BaseModel):
-    command: str = Field(..., min_length=1)
-    sample_rows: int = Field(default=3, ge=3, le=5)
+    command: str = Field(..., description="e.g. 'Create a students table with name and cgpa'")
 
 
-class BlueprintColumn(BaseModel):
-    name: str
-    type: str
-
-
-class BlueprintResponse(BaseModel):
-    table_name: str
-    columns: list[BlueprintColumn]
-    sample_data: list[dict[str, Any]]
-
+# ── Responses ─────────────────────────────────────────────────────────────────
 
 class ParseResponse(BaseModel):
+    intent: str
+    table_name: str
+    columns: list[str]
+    sql: str
+    is_destructive: bool
+    raw_command: str
+
+
+class RunResponse(BaseModel):
     success: bool
-    plan: dict[str, Any]
-    sql: str | None = None
-    notes: list[str] = Field(default_factory=list)
-
-
-class ExecuteResponse(BaseModel):
-    success: bool
-    message: str
-    plan: dict[str, Any]
-    file_path: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    data_preview: list[dict[str, Any]] = Field(default_factory=list)
-    chart: dict[str, Any] | None = None
-
-
-class HealthResponse(BaseModel):
-    status: str
-    mysql_configured: bool
-    llm_enabled: bool
+    message: str = ""
+    sql_executed: str = ""
+    rows_affected: int = 0
+    data: list[dict[str, Any]] | None = None
+    error: str = ""

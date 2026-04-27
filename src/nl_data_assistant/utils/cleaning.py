@@ -1,3 +1,6 @@
+"""
+utils/cleaning.py — DataFrame normalization utilities.
+"""
 from __future__ import annotations
 
 import re
@@ -5,57 +8,76 @@ import re
 import pandas as pd
 
 
-def normalize_identifier(value: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", str(value).strip().lower()).strip("_")
-    return cleaned or "column"
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize a raw DataFrame for MySQL import:
+    - Strip + lowercase column names, replace spaces/dashes with underscores
+    - Remove completely empty rows and columns
+    - Strip leading/trailing whitespace from string cells
+    - Coerce numeric-looking strings to numbers
+    - Parse date-looking strings to datetime
+    """
+    df = df.copy()
+
+    # Clean column names
+    df.columns = _clean_column_names(df.columns)
+
+    # Drop fully empty rows and columns
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+
+    # Strip string values
+    str_cols = df.select_dtypes(include="object").columns
+    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip() if hasattr(s, "str") else s)
+
+    # Coerce numeric strings
+    for col in str_cols:
+        df[col] = _try_numeric(df[col])
+
+    # Coerce date strings
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = _try_datetime(df[col])
+
+    return df.reset_index(drop=True)
 
 
-class DataCleaner:
-    """Normalizes headers, trims strings, and gently coerces data types."""
+def _clean_column_names(columns: pd.Index) -> pd.Index:
+    cleaned = (
+        columns.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[\s\-/\\\.]+", "_", regex=True)
+        .str.replace(r"[^a-z0-9_]", "", regex=True)
+        .str.replace(r"^(\d)", r"col_\1", regex=True)  # can't start with digit
+    )
+    # Deduplicate
+    seen: dict[str, int] = {}
+    result = []
+    for name in cleaned:
+        if name in seen:
+            seen[name] += 1
+            result.append(f"{name}_{seen[name]}")
+        else:
+            seen[name] = 0
+            result.append(name)
+    return pd.Index(result)
 
-    def clean_dataframe(self, dataframe: pd.DataFrame) -> pd.DataFrame:
-        cleaned = dataframe.copy()
-        cleaned.columns = [normalize_identifier(column) for column in cleaned.columns]
-        cleaned = cleaned.replace(r"^\s*$", pd.NA, regex=True)
-        cleaned = cleaned.dropna(how="all")
-        cleaned = cleaned.dropna(axis=1, how="all")
 
-        for column in cleaned.columns:
-            series = cleaned[column]
-            if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-                cleaned[column] = series.astype("string").str.strip()
-            cleaned[column] = self._coerce_series(cleaned[column], column)
+def _try_numeric(series: pd.Series) -> pd.Series:
+    try:
+        converted = pd.to_numeric(series, errors="coerce")
+        # Only convert if >50 % of non-null values parsed successfully
+        if converted.notna().sum() / max(series.notna().sum(), 1) > 0.5:
+            return converted
+    except Exception:
+        pass
+    return series
 
-        return cleaned.reset_index(drop=True)
 
-    def _coerce_series(self, series: pd.Series, column_name: str) -> pd.Series:
-        if series.dropna().empty:
-            return series
-
-        numeric = pd.to_numeric(series, errors="coerce")
-        if numeric.notna().sum() >= max(1, int(series.notna().sum() * 0.7)):
-            return numeric
-
-        if any(token in column_name for token in ("date", "time", "month", "year")):
-            parsed = pd.to_datetime(series, errors="coerce", format="mixed")
-            if parsed.notna().sum() >= max(1, int(series.notna().sum() * 0.7)):
-                return parsed
-
-        if self._looks_temporal(series):
-            parsed = pd.to_datetime(series, errors="coerce", format="mixed")
-            if parsed.notna().sum() >= max(1, int(series.notna().sum() * 0.8)):
-                return parsed
-
-        return series
-
-    def _looks_temporal(self, series: pd.Series) -> bool:
-        sample = series.dropna().astype(str).head(10)
-        if sample.empty:
-            return False
-
-        temporal_pattern = (
-            r"^\d{4}-\d{1,2}-\d{1,2}$|^\d{1,2}/\d{1,2}/\d{2,4}$|"
-            r"^\d{1,2}-\d{1,2}-\d{2,4}$|^\d{1,2}:\d{2}(:\d{2})?$"
-        )
-        hits = sample.str.match(temporal_pattern, na=False).sum()
-        return hits >= max(1, int(len(sample) * 0.6))
+def _try_datetime(series: pd.Series) -> pd.Series:
+    try:
+        converted = pd.to_datetime(series, infer_datetime_format=True, errors="coerce")
+        if converted.notna().sum() / max(series.notna().sum(), 1) > 0.5:
+            return converted
+    except Exception:
+        pass
+    return series

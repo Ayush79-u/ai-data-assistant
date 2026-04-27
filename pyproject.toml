@@ -1,17 +1,53 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "nl-data-assistant"
-version = "0.1.0"
-description = "Natural-language assistant for Excel, MySQL, and visual analytics."
+version = "0.2.0"
+description = "Natural-language assistant for Excel, MySQL, and visual analytics running locally."
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pandas>=2.2.0",
+    "openpyxl>=3.1.0",
+    "SQLAlchemy>=2.0.0",
+    "PyMySQL>=1.1.0",
+    "plotly>=5.20.0",
+    "streamlit>=1.33.0",
+    "streamlit-ace>=0.1.1",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-dotenv>=1.0.0",
+    "sqlparse>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+nl-assistant = "nl_data_assistant.main:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

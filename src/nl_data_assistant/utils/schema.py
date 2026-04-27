@@ -1,59 +1,50 @@
+"""
+utils/schema.py — DB schema introspection helpers.
+"""
 from __future__ import annotations
 
-import re
-
 import pandas as pd
-
-from nl_data_assistant.models import ColumnSpec
-from nl_data_assistant.utils.cleaning import normalize_identifier
+from sqlalchemy import Engine, inspect, text
 
 
-class SchemaMapper:
-    def parse_columns_from_text(self, phrase: str) -> list[ColumnSpec]:
-        if not phrase.strip():
-            return []
+def get_schema_summary(engine: Engine) -> str:
+    """
+    Return a compact, human-readable schema string suitable for
+    injecting into a Claude system prompt.
 
-        cleaned_phrase = re.sub(r"\b(columns?|fields?)\b", "", phrase, flags=re.IGNORECASE)
-        raw_parts = re.split(r",| and ", cleaned_phrase)
-        columns = []
-        for raw_name in raw_parts:
-            value = raw_name.strip(" .")
-            if not value:
-                continue
-            safe_name = normalize_identifier(value)
-            columns.append(ColumnSpec(name=safe_name, data_type=self.guess_type_from_name(value)))
-        return columns
+    Example output:
+      tables: students(id INT, name VARCHAR, cgpa FLOAT); expenses(id INT, month VARCHAR, amount DECIMAL)
+    """
+    insp = inspect(engine)
+    parts: list[str] = []
+    for table in insp.get_table_names():
+        cols = ", ".join(
+            f"{c['name']} {c['type']}" for c in insp.get_columns(table)
+        )
+        parts.append(f"{table}({cols})")
+    return "tables: " + "; ".join(parts) if parts else "(no tables yet)"
 
-    def guess_type_from_name(self, value: str) -> str:
-        lowered = value.lower()
-        if any(token in lowered for token in ("id", "roll", "age", "year", "count", "qty", "quantity")):
-            return "INT"
-        if any(
-            token in lowered
-            for token in ("cgpa", "gpa", "price", "amount", "cost", "score", "salary", "rate", "percent")
-        ):
-            return "FLOAT"
-        if any(token in lowered for token in ("date", "time", "month")):
-            return "DATETIME"
-        return "VARCHAR(255)"
 
-    def dataframe_to_columns(self, dataframe: pd.DataFrame) -> list[ColumnSpec]:
-        columns: list[ColumnSpec] = []
-        for name, dtype in dataframe.dtypes.items():
-            columns.append(ColumnSpec(name=normalize_identifier(str(name)), data_type=self.map_dtype(dtype)))
-        return columns
+def get_table_info(engine: Engine, table_name: str) -> pd.DataFrame:
+    """Return column info for a single table as a DataFrame."""
+    insp = inspect(engine)
+    cols = insp.get_columns(table_name)
+    return pd.DataFrame([
+        {
+            "column": c["name"],
+            "type": str(c["type"]),
+            "nullable": c.get("nullable", True),
+            "default": c.get("default"),
+        }
+        for c in cols
+    ])
 
-    def map_dtype(self, dtype: object) -> str:
-        if pd.api.types.is_integer_dtype(dtype):
-            return "BIGINT"
-        if pd.api.types.is_float_dtype(dtype):
-            return "FLOAT"
-        if pd.api.types.is_bool_dtype(dtype):
-            return "BOOLEAN"
-        if pd.api.types.is_datetime64_any_dtype(dtype):
-            return "DATETIME"
-        return "VARCHAR(255)"
 
-    def ensure_safe_name(self, value: str | None, fallback: str) -> str:
-        return normalize_identifier(value or fallback)
+def table_exists(engine: Engine, table_name: str) -> bool:
+    return table_name.lower() in {t.lower() for t in inspect(engine).get_table_names()}
 
+
+def get_row_count(engine: Engine, table_name: str) -> int:
+    with engine.connect() as conn:
+        result = conn.execute(text(f"SELECT COUNT(*) FROM `{table_name}`"))
+        return result.scalar() or 0

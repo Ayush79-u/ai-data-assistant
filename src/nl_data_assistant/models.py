@@ -1,47 +1,69 @@
+"""
+models.py — shared data models for the NL data assistant pipeline.
+"""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 
-@dataclass(slots=True)
-class ColumnSpec:
-    name: str
-    data_type: str = "VARCHAR(255)"
-    nullable: bool = True
+class Intent(str, Enum):
+    CREATE_TABLE = "create_table"
+    INSERT = "insert"
+    SELECT = "select"
+    UPDATE = "update"
+    DELETE = "delete"
+    DROP_TABLE = "drop_table"
+    IMPORT_EXCEL = "import_excel"
+    EXPORT_EXCEL = "export_excel"
+    CREATE_EXCEL = "create_excel"
+    SHOW_EXCEL = "show_excel"
+    VISUALIZE = "visualize"
+    DESCRIBE = "describe"
+    UNKNOWN = "unknown"
 
 
-@dataclass(slots=True)
+# Intents that modify or destroy data — require user confirmation in the UI.
+DESTRUCTIVE_INTENTS: frozenset[Intent] = frozenset(
+    {Intent.DELETE, Intent.DROP_TABLE, Intent.UPDATE}
+)
+
+DESTRUCTIVE_SQL_KEYWORDS: frozenset[str] = frozenset(
+    {"drop", "delete", "truncate", "alter"}
+)
+
+
+def is_destructive_sql(sql: str) -> bool:
+    first_word = sql.strip().split()[0].lower() if sql.strip() else ""
+    return first_word in DESTRUCTIVE_SQL_KEYWORDS
+
+
+@dataclass
 class ActionPlan:
-    action: str
-    target: str | None = None
-    table_name: str | None = None
-    sheet_name: str | None = None
-    workbook_path: str | None = None
-    source_path: str | None = None
-    destination_path: str | None = None
-    columns: list[ColumnSpec] = field(default_factory=list)
-    query: str | None = None
-    parameters: Any = None
-    chart_type: str | None = None
-    x_column: str | None = None
-    y_column: str | None = None
-    title: str | None = None
-    limit: int = 200
-    use_last_result: bool = False
-    entities: dict[str, Any] = field(default_factory=dict)
-    notes: list[str] = field(default_factory=list)
+    intent: Intent = Intent.UNKNOWN
+    table_name: str = ""
+    columns: list[str] = field(default_factory=list)
+    values: list[dict[str, Any]] = field(default_factory=list)
+    conditions: str = ""
+    order_by: str = ""
+    limit: int | None = None
+    file_path: str = ""
+    chart_type: str = ""
+    sql: str = ""                  # raw SQL when provided directly
+    raw_command: str = ""          # original user text
+    error: str = ""
 
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    @property
+    def is_destructive(self) -> bool:
+        return self.intent in DESTRUCTIVE_INTENTS or is_destructive_sql(self.sql)
 
 
-@dataclass(slots=True)
+@dataclass
 class ExecutionResult:
     success: bool
-    message: str
-    plan: ActionPlan
-    dataframe: Any = None
-    figure: Any = None
-    file_path: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    message: str = ""
+    data: Any = None              # DataFrame, list of dicts, or chart figure
+    sql_executed: str = ""
+    rows_affected: int = 0
+    error: str = ""

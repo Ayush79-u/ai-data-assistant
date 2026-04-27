@@ -1,106 +1,112 @@
+"""
+table_blueprint.py — Generate a JSON table schema + sample data locally.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from nl_data_assistant.models import ColumnSpec
-from nl_data_assistant.nlp.local_parser import detect_intent, extract_entities
-from nl_data_assistant.utils.schema import SchemaMapper
-
 
 NAME_SAMPLES = ["Ayush", "Riya", "Karan", "Neha", "Aman"]
-PRODUCT_SAMPLES = ["Notebook", "Keyboard", "Bottle", "Monitor", "Headphones"]
-CATEGORY_SAMPLES = ["Electronics", "Stationery", "Home", "Travel", "Health"]
-DEPARTMENT_SAMPLES = ["Sales", "HR", "Finance", "Engineering", "Support"]
-EMAIL_SAMPLES = [
-    "ayush@example.com",
-    "riya@example.com",
-    "karan@example.com",
-    "neha@example.com",
-    "aman@example.com",
-]
+TEXT_SAMPLES = ["sample_1", "sample_2", "sample_3", "sample_4", "sample_5"]
 
 
-@dataclass(slots=True)
 class TableBlueprint:
-    table_name: str
-    columns: list[dict[str, str]]
-    sample_data: list[dict[str, Any]]
+    def generate(self, command: str) -> dict:
+        table_name = self._extract_table_name(command)
+        columns = self._extract_columns(command)
+        if not columns:
+            columns = [{"name": "value", "type": "VARCHAR(255)", "primary_key": False}]
 
-    def as_dict(self) -> dict[str, Any]:
+        full_columns = [{"name": "id", "type": "INT AUTO_INCREMENT", "primary_key": True}] + columns
+        sample_data = self._sample_rows(columns, row_count=3)
         return {
-            "table_name": self.table_name,
-            "columns": self.columns,
-            "sample_data": self.sample_data,
+            "table_name": table_name,
+            "columns": full_columns,
+            "sample_data": sample_data,
+            "create_sql": self._build_create_sql(table_name, full_columns),
         }
 
+    def _extract_table_name(self, command: str) -> str:
+        patterns = [
+            r"(?:create|make|build)(?:\s+a|\s+an)?\s+([a-zA-Z_][\w]*)\s+table",
+            r"(?:create|make|build)(?:\s+a|\s+an)?\s+table(?:\s+of|\s+named|\s+called)?\s+([a-zA-Z_][\w]*)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, command, re.IGNORECASE)
+            if match:
+                return self._safe_name(match.group(1))
+        return "new_table"
 
-def command_to_blueprint(
-    text: str,
-    sample_rows: int = 3,
-    schema_mapper: SchemaMapper | None = None,
-) -> dict[str, Any]:
-    schema_mapper = schema_mapper or SchemaMapper()
-    intent = detect_intent(text)
-    if intent != "create_table":
-        raise ValueError("Blueprint generation currently supports table-creation style commands only.")
+    def _extract_columns(self, command: str) -> list[dict[str, Any]]:
+        match = re.search(r"\bwith\b\s+(.+)$", command, re.IGNORECASE)
+        if not match:
+            return []
 
-    entities = extract_entities(text, intent="create_table", schema_mapper=schema_mapper)
-    table_name = entities.get("table_name") or "new_table"
-    column_specs: list[ColumnSpec] = entities.get("column_specs") or [ColumnSpec(name="id", data_type="INT")]
+        raw_columns = re.split(r",|\band\b", match.group(1), flags=re.IGNORECASE)
+        results = []
+        for raw in raw_columns:
+            name = self._safe_name(raw.strip())
+            if not name:
+                continue
+            results.append({"name": name, "type": self._infer_type(name), "primary_key": False})
+        return results
 
-    safe_row_count = max(3, min(5, int(sample_rows)))
-    blueprint = TableBlueprint(
-        table_name=table_name,
-        columns=[{"name": column.name, "type": column.data_type} for column in column_specs],
-        sample_data=build_sample_rows(column_specs, safe_row_count),
-    )
-    return blueprint.as_dict()
+    def _infer_type(self, column_name: str) -> str:
+        name = column_name.lower()
+        if any(token in name for token in ("id", "count", "qty", "quantity", "age", "year")):
+            return "INT"
+        if any(token in name for token in ("cgpa", "gpa", "salary", "price", "amount", "rate", "score")):
+            return "FLOAT"
+        if any(token in name for token in ("date", "time", "joined", "created")):
+            return "DATETIME"
+        if any(token in name for token in ("is_", "has_", "active", "enabled")):
+            return "TINYINT(1)"
+        return "VARCHAR(255)"
 
+    def _sample_rows(self, columns: list[dict[str, Any]], row_count: int) -> list[dict[str, Any]]:
+        rows = []
+        for row_index in range(row_count):
+            row = {}
+            for column in columns:
+                row[column["name"]] = self._sample_value(column["name"], column["type"], row_index)
+            rows.append(row)
+        return rows
 
-def build_sample_rows(columns: list[ColumnSpec], row_count: int) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for index in range(row_count):
-        row = {}
+    def _sample_value(self, name: str, sql_type: str, index: int) -> Any:
+        lowered = name.lower()
+        upper = sql_type.upper()
+
+        if "name" in lowered:
+            return NAME_SAMPLES[index % len(NAME_SAMPLES)]
+        if upper.startswith("INT"):
+            if "quantity" in lowered or "qty" in lowered:
+                return [10, 20, 15, 8, 12][index % 5]
+            return index + 1
+        if upper.startswith("FLOAT") or upper.startswith("DECIMAL") or upper.startswith("DOUBLE"):
+            if "cgpa" in lowered or "gpa" in lowered:
+                return [8.5, 9.1, 7.8, 8.2, 9.4][index % 5]
+            if "salary" in lowered:
+                return [45000.0, 52000.0, 61000.0, 58000.0, 67000.0][index % 5]
+            if "price" in lowered or "amount" in lowered:
+                return [199.99, 349.5, 99.0, 499.0, 249.75][index % 5]
+            return [10.5, 20.25, 30.75, 40.0, 50.5][index % 5]
+        if upper.startswith("DATETIME"):
+            value = datetime(2026, 4, 1, 9, 0, 0) + timedelta(days=index)
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if upper.startswith("TINYINT"):
+            return [1, 0, 1, 1, 0][index % 5]
+        return TEXT_SAMPLES[index % len(TEXT_SAMPLES)] if "name" not in lowered else NAME_SAMPLES[index % len(NAME_SAMPLES)]
+
+    def _build_create_sql(self, table_name: str, columns: list[dict[str, Any]]) -> str:
+        lines = []
         for column in columns:
-            row[column.name] = sample_value(column.name, column.data_type, index)
-        rows.append(row)
-    return rows
+            if column.get("primary_key"):
+                lines.append(f"  `{column['name']}` {column['type']} PRIMARY KEY")
+            else:
+                lines.append(f"  `{column['name']}` {column['type']}")
+        return f"CREATE TABLE IF NOT EXISTS `{table_name}` (\n" + ",\n".join(lines) + "\n);"
 
-
-def sample_value(column_name: str, sql_type: str, index: int) -> Any:
-    lowered = column_name.lower()
-    sql_upper = sql_type.upper()
-
-    if "name" in lowered:
-        return NAME_SAMPLES[index % len(NAME_SAMPLES)]
-    if "product" in lowered:
-        return PRODUCT_SAMPLES[index % len(PRODUCT_SAMPLES)]
-    if "category" in lowered:
-        return CATEGORY_SAMPLES[index % len(CATEGORY_SAMPLES)]
-    if "department" in lowered:
-        return DEPARTMENT_SAMPLES[index % len(DEPARTMENT_SAMPLES)]
-    if "email" in lowered:
-        return EMAIL_SAMPLES[index % len(EMAIL_SAMPLES)]
-
-    if sql_upper.startswith("INT") or sql_upper.startswith("BIGINT"):
-        if "quantity" in lowered:
-            return [12, 20, 8, 15, 30][index % 5]
-        return [1, 2, 3, 4, 5][index % 5]
-
-    if sql_upper.startswith("FLOAT") or sql_upper.startswith("DOUBLE") or sql_upper.startswith("DECIMAL"):
-        if "cgpa" in lowered or "gpa" in lowered:
-            return [8.5, 9.1, 7.8, 8.2, 9.4][index % 5]
-        if "salary" in lowered:
-            return [45000.0, 52000.0, 61000.0, 58000.0, 67000.0][index % 5]
-        if "price" in lowered:
-            return [199.99, 349.5, 99.0, 499.0, 249.75][index % 5]
-        return [10.5, 20.75, 30.25, 40.0, 50.5][index % 5]
-
-    if "DATE" in sql_upper or "TIME" in sql_upper:
-        base = datetime(2026, 4, 1, 10, 0, 0) + timedelta(days=index)
-        return base.strftime("%Y-%m-%d %H:%M:%S")
-
-    return f"{column_name}_{index + 1}"
-
+    def _safe_name(self, value: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
