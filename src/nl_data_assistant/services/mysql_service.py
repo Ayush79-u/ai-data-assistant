@@ -166,6 +166,11 @@ class MySQLService:
                 clean_df = clean_df.drop(columns=extra_columns)
 
             clean_df = clean_df[writable_columns]
+
+            # remove rows where every editable column is blank
+            clean_df = clean_df.dropna(how="all")
+
+            # convert NaN to None for MySQL NULL support
             clean_df = clean_df.where(pd.notnull(clean_df), None)
 
             delete_sql = f"DELETE FROM `{safe_name}`;"

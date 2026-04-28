@@ -1,10 +1,17 @@
 """
-streamlit_workspace_app.py - MySQL terminal + assistant workspace.
+streamlit_workspace_app.py
+
+What changed from the old version:
+- SQL Console pane is GONE — users type English, not SQL
+- Assistant Chat is now the main/only input area
+- Light / Dark mode toggle in the header
+- MySQL Explorer sidebar kept (databases, tables, schema)
+- All features preserved: NL→SQL execution, table preview, query history,
+  Excel import/export, destructive confirmation, save chat
 """
 from __future__ import annotations
 
 import io
-import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -15,835 +22,637 @@ import streamlit as st
 from nl_data_assistant.models import ExecutionResult, Intent
 from nl_data_assistant.services.engine import DataAssistantEngine
 
-try:
-    from streamlit_ace import st_ace
-except ImportError:  # pragma: no cover - optional local dependency
-    st_ace = None
 
-
-SQL_KEYWORDS = [
-    "SELECT",
-    "SHOW",
-    "INSERT INTO",
-    "UPDATE",
-    "DELETE FROM",
-    "CREATE DATABASE",
-    "CREATE TABLE",
-    "ALTER TABLE",
-    "DROP TABLE",
-    "DROP DATABASE",
-    "TRUNCATE TABLE",
-    "DESCRIBE",
-    "USE",
-    "WHERE",
-    "ORDER BY",
-    "GROUP BY",
-    "LIMIT",
-    "JOIN",
-]
-
-SQL_COMMAND_PREFIXES = (
-    "SELECT",
-    "SHOW",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "TRUNCATE",
-    "DESCRIBE",
-    "USE",
-    "EXPLAIN",
-    "WITH",
-)
-
-SYSTEM_DATABASES = {"information_schema", "mysql", "performance_schema", "sys"}
-
-
-def run_streamlit_app() -> None:
-    st.set_page_config(
-        page_title="Local MySQL Workspace",
-        page_icon="🗃️",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
-    _inject_css()
-    _init_session()
-    _render_status_banner()
-
-    st.title("🗃️ Local MySQL Workspace")
-    st.caption("A MySQL-style SQL console with persistent chat, table editing, and local session memory.")
-
-    sidebar_col, main_col = st.columns([0.8, 2.2], gap="large")
-    with sidebar_col:
-        _render_sidebar()
-
-    with main_col:
-        sql_col, chat_col = st.columns([1.55, 1], gap="large")
-        with sql_col:
-            _render_sql_workspace()
-        with chat_col:
-            _render_chat_workspace()
-
-        lower_tab_history, lower_tab_excel = st.tabs(["Command History", "Excel Tools"])
-        with lower_tab_history:
-            _render_query_history_panel()
-        with lower_tab_excel:
-            _render_excel_tools()
-
-
-def _init_session() -> None:
-    if "engine" not in st.session_state:
-        st.session_state.engine = DataAssistantEngine()
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "query_log" not in st.session_state:
-        st.session_state.query_log = []
-    if "sql_history" not in st.session_state:
-        st.session_state.sql_history = []
-    if "sql_history_index" not in st.session_state:
-        st.session_state.sql_history_index = -1
-    if "sql_console_text" not in st.session_state:
-        st.session_state.sql_console_text = ""
-    if "sql_console_version" not in st.session_state:
-        st.session_state.sql_console_version = 0
-    if "last_query_result" not in st.session_state:
-        st.session_state.last_query_result = None
-    if "last_query_sql" not in st.session_state:
-        st.session_state.last_query_sql = ""
-    if "pending_plan" not in st.session_state:
-        st.session_state.pending_plan = None
-    if "current_database" not in st.session_state:
-        st.session_state.current_database = _engine().mysql.current_database
-    if "current_table" not in st.session_state:
-        st.session_state.current_table = ""
-    if "table_editor_df" not in st.session_state:
-        st.session_state.table_editor_df = pd.DataFrame()
-    if "table_editor_table" not in st.session_state:
-        st.session_state.table_editor_table = ""
-    if "table_editor_version" not in st.session_state:
-        st.session_state.table_editor_version = 0
-    if "status_banner" not in st.session_state:
-        st.session_state.status_banner = None
-    _sync_session_context()
-
-
-def _engine() -> DataAssistantEngine:
-    return st.session_state.engine
-
-
-def _sync_session_context() -> None:
-    mysql = _engine().mysql
-    st.session_state.current_database = mysql.current_database
-    current_table = st.session_state.current_table.strip()
-    available_tables = {name.lower() for name in mysql.get_table_names()}
-    if current_table and current_table.lower() not in available_tables:
-        st.session_state.current_table = ""
-        st.session_state.table_editor_table = ""
-        st.session_state.table_editor_df = pd.DataFrame()
-
-
-def _render_status_banner() -> None:
-    banner = st.session_state.status_banner
-    if not banner:
-        return
-
-    kind = banner.get("kind", "info")
-    message = banner.get("message", "")
-    if kind == "success":
-        st.success(message)
-    elif kind == "error":
-        st.error(message)
-    else:
-        st.info(message)
-    st.session_state.status_banner = None
-
-
-def _render_sidebar() -> None:
-    st.subheader("MySQL Explorer")
-    mysql = _engine().mysql
-
-    if mysql.ping():
-        st.success("Connected to MySQL", icon="✅")
-    else:
-        st.error("MySQL connection failed. Check your `.env` settings.", icon="🔴")
-        st.stop()
-
-    col_db, col_refresh = st.columns([3, 1])
-    with col_db:
-        databases = mysql.get_database_names()
-        current_db = st.session_state.current_database
-        selected_database = st.selectbox(
-            "Databases",
-            options=[""] + databases,
-            index=([""] + databases).index(current_db) if current_db in databases else 0,
-            key="sidebar_database_select",
-        )
-    with col_refresh:
-        if st.button("↻", use_container_width=True, help="Refresh databases and tables"):
-            _sync_session_context()
-            st.rerun()
-
-    if selected_database and selected_database != current_db:
-        result = mysql.use_database(selected_database)
-        if result.success:
-            st.session_state.current_database = mysql.current_database
-            st.session_state.current_table = ""
-            st.session_state.table_editor_table = ""
-            st.session_state.table_editor_df = pd.DataFrame()
-            _set_status("success", result.message)
-        else:
-            _set_status("error", result.error or result.message)
-        st.rerun()
-
-    current_db = st.session_state.current_database
-    if current_db:
-        st.caption(f"Current database: `{current_db}`")
-        tables = mysql.get_table_names()
-        selected_table = st.selectbox(
-            "Tables",
-            options=[""] + tables,
-            index=([""] + tables).index(st.session_state.current_table)
-            if st.session_state.current_table in tables
-            else 0,
-            key="sidebar_table_select",
-        )
-        if selected_table and selected_table != st.session_state.current_table:
-            st.session_state.current_table = selected_table
-            _refresh_table_editor(selected_table)
-            st.rerun()
-
-        if st.session_state.current_table:
-            with st.expander("Selected table schema", expanded=False):
-                for column in mysql.get_table_columns(st.session_state.current_table):
-                    st.markdown(f"- `{column['name']}`: `{column['type']}`")
-
-            _render_export_buttons(st.session_state.current_table)
-    else:
-        st.info("Run `CREATE DATABASE ...` or `USE database_name` in the SQL console to start.")
-
-    with st.expander("Quick SQL examples", expanded=False):
-        examples = [
-            "CREATE DATABASE school;",
-            "USE school;",
-            "CREATE TABLE students (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255), cgpa FLOAT);",
-            "INSERT INTO students (name, cgpa) VALUES ('Ayush', 8.7);",
-            "SELECT * FROM students ORDER BY cgpa DESC;",
-            "SHOW TABLES;",
-        ]
-        for example in examples:
-            if st.button(example, key=f"sidebar_example_{example}", use_container_width=True):
-                _load_sql_into_console(example)
-                st.rerun()
-
-
-def _render_sql_workspace() -> None:
-    st.subheader("SQL Console")
-
-    if st.session_state.current_database:
-        st.caption(f"Connected context: `{st.session_state.current_database}`")
-    else:
-        st.caption("No database selected yet. You can still run `SHOW DATABASES;` or `CREATE DATABASE ...`.")
-
-    _render_sql_console_panel()
-    _render_result_panel()
-    _render_table_editor_panel()
-
-
-def _render_sql_console_panel() -> None:
-    col_run, col_prev, col_next, col_clear = st.columns([1.3, 0.9, 0.9, 1.1])
-    if col_run.button("Run SQL", type="primary", use_container_width=True):
-        _run_console_sql()
-    if col_prev.button("↑ Prev", use_container_width=True):
-        _load_previous_command()
-        st.rerun()
-    if col_next.button("↓ Next", use_container_width=True):
-        _load_next_command()
-        st.rerun()
-    if col_clear.button("Clear SQL", use_container_width=True):
-        _load_sql_into_console("")
-        st.rerun()
-
-    editor_key = f"sql_console_editor_{st.session_state.sql_console_version}"
-    if st_ace is not None:
-        ace_theme = "tomorrow_night_bright" if st.get_option("theme.base") == "dark" else "chrome"
-        editor_text = st_ace(
-            value=st.session_state.sql_console_text,
-            language="sql",
-            theme=ace_theme,
-            key=editor_key,
-            height=220,
-            auto_update=True,
-            font_size=14,
-            wrap=True,
-            show_gutter=True,
-            keybinding="vscode",
-        )
-        st.session_state.sql_console_text = editor_text or st.session_state.sql_console_text
-    else:
-        st.info("Install `streamlit-ace` for syntax highlighting and a richer SQL editor. Using the built-in console for now.")
-        st.session_state.sql_console_text = st.text_area(
-            "SQL command console",
-            value=st.session_state.sql_console_text,
-            key=editor_key,
-            height=220,
-            placeholder="Type MySQL commands here, for example:\nSHOW DATABASES;\nUSE school;\nSELECT * FROM students;",
-        )
-        if st.session_state.sql_console_text.strip():
-            st.code(st.session_state.sql_console_text, language="sql")
-
-    suggestions = _suggest_sql_keywords(st.session_state.sql_console_text)
-    if suggestions:
-        st.caption("Suggestions")
-        suggestion_cols = st.columns(min(len(suggestions), 4))
-        for index, keyword in enumerate(suggestions[:8]):
-            with suggestion_cols[index % len(suggestion_cols)]:
-                if st.button(keyword, key=f"sql_suggestion_{keyword}_{index}", use_container_width=True):
-                    _append_sql_keyword(keyword)
-                    st.rerun()
-
-    st.caption("History buttons and the command log below let you quickly reuse earlier SQL.")
-
-
-def _render_result_panel() -> None:
-    result: ExecutionResult | None = st.session_state.last_query_result
-    if result is None:
-        st.info("Run a SQL command to see results here.")
-        return
-
-    st.markdown("**Result**")
-    if result.error:
-        st.error(result.error)
-    elif result.message:
-        st.success(result.message)
-
-    if result.sql_executed:
-        st.code(result.sql_executed, language="sql")
-
-    _render_execution_result(result)
-
-
-def _render_table_editor_panel() -> None:
-    with st.expander("Table Editor", expanded=bool(st.session_state.current_table)):
-        current_table = st.session_state.current_table
-        if not current_table:
-            st.info("Pick a table from the sidebar or run a query that targets a table to edit data here.")
-            return
-
-        if st.session_state.table_editor_table != current_table:
-            _refresh_table_editor(current_table)
-
-        st.caption(f"Editing `{current_table}` in `{st.session_state.current_database}`")
-        col_reload, col_save = st.columns([1, 1])
-        if col_reload.button("Reload table", key="reload_editor_table", use_container_width=True):
-            _refresh_table_editor(current_table)
-            st.rerun()
-
-        editor_key = f"table_editor_widget_{current_table}_{st.session_state.table_editor_version}"
-        edited_df = st.data_editor(
-            st.session_state.table_editor_df,
-            key=editor_key,
-            num_rows="dynamic",
-            use_container_width=True,
-        )
-        st.session_state.table_editor_df = edited_df
-
-        if col_save.button("Save table changes", key="save_editor_table", type="primary", use_container_width=True):
-            result = _engine().mysql.replace_table_data(current_table, edited_df)
-            if result.success:
-                _log_query(result)
-                st.session_state.last_query_result = result
-                st.session_state.last_query_sql = result.sql_executed
-                _append_message(
-                    "assistant",
-                    f"Saved the edited rows back to `{current_table}`.",
-                    result,
-                )
-                _refresh_table_editor(current_table)
-                _set_status("success", result.message)
-                st.rerun()
-            else:
-                st.error(result.error or result.message)
-
-
-def _render_chat_workspace() -> None:
-    st.subheader("Assistant Chat")
-
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            result = message.get("result")
-            if isinstance(result, ExecutionResult):
-                _render_execution_result(result)
-
-    if st.session_state.pending_plan is not None:
-        plan = st.session_state.pending_plan
-        st.warning(
-            f"This will {plan.intent.value.replace('_', ' ')} on `{plan.table_name or st.session_state.current_table or 'the active table'}`.",
-            icon="⚠️",
-        )
-        confirm_col, cancel_col = st.columns(2)
-        if confirm_col.button("Confirm action", key="confirm_pending_plan", type="primary", use_container_width=True):
-            result = _engine().execute(plan)
-            _handle_nl_result(plan, result)
-            st.session_state.pending_plan = None
-            st.rerun()
-        if cancel_col.button("Cancel", key="cancel_pending_plan", use_container_width=True):
-            st.session_state.pending_plan = None
-            st.rerun()
-
-    control_col, info_col = st.columns([1.15, 1.85])
-    with control_col:
-        with st.popover("Clear Chat History"):
-            choice = st.radio(
-                "What should happen to MySQL data?",
-                options=["Keep current MySQL data", "Reset current database data"],
-                key="clear_chat_choice",
-            )
-            if st.button("Confirm clear", key="confirm_clear_chat", type="primary", use_container_width=True):
-                _clear_chat_history(reset_sql_data=choice == "Reset current database data")
-                st.rerun()
-    with info_col:
-        if st.session_state.current_database:
-            st.caption(
-                f"Chat context stays connected to `{st.session_state.current_database}`"
-                + (f" → `{st.session_state.current_table}`" if st.session_state.current_table else "")
-            )
-        else:
-            st.caption("Chat memory is active. SQL context will continue until you clear it.")
-
-    prompt = st.chat_input("Ask for SQL help, or paste a MySQL command directly.")
-    if not prompt:
-        return
-
-    _append_message("user", prompt)
-
-    if _looks_like_sql(prompt):
-        result = _execute_sql_command(prompt)
-        _append_message("assistant", _result_summary(result), result)
-        st.rerun()
-
-    plan = _engine().parse(prompt, default_table=st.session_state.current_table)
-    if plan.is_destructive:
-        st.session_state.pending_plan = plan
-        _append_message(
-            "assistant",
-            (
-                f"I parsed this as `{plan.intent.value}` for "
-                f"`{plan.table_name or st.session_state.current_table or 'the current table'}`. "
-                "Please confirm the action below."
-            ),
-        )
-        st.rerun()
-
-    result = _engine().execute(plan)
-    _handle_nl_result(plan, result)
-    st.rerun()
-
-
-def _render_query_history_panel() -> None:
-    if not st.session_state.sql_history:
-        st.info("No SQL commands run yet.")
-        return
-
-    st.markdown("**SQL Command History**")
-    for index, command in enumerate(reversed(st.session_state.sql_history[-25:]), start=1):
-        entry_key = f"history_{index}_{command}"
-        with st.expander(command[:100] + ("..." if len(command) > 100 else ""), expanded=False):
-            st.code(command, language="sql")
-            col_load, col_run = st.columns(2)
-            if col_load.button("Load into console", key=f"load_{entry_key}", use_container_width=True):
-                _load_sql_into_console(command)
-                st.rerun()
-            if col_run.button("Run again", key=f"rerun_{entry_key}", use_container_width=True):
-                result = _execute_sql_command(command)
-                _append_message("assistant", _result_summary(result), result)
-                st.rerun()
-
-    sql_dump = "\n\n".join(
-        f"-- {entry['ts']} {'OK' if entry['ok'] else 'FAILED'}\n{entry['sql']}"
-        for entry in st.session_state.query_log
-    )
-    st.download_button(
-        "Download command log as .sql",
-        data=sql_dump,
-        file_name="mysql_workspace_history.sql",
-        mime="text/plain",
-        use_container_width=True,
-    )
-def _execute_sql_command(sql: str) -> ExecutionResult:
-    result = _engine().execute_raw(sql)
-    _push_sql_history(sql)
-    _log_query(result)
-    st.session_state.last_query_result = result
-    st.session_state.last_query_sql = sql
-    _sync_context_after_sql(sql, result)
-    return result
-
-
-def _handle_nl_result(plan, result: ExecutionResult) -> None:
-    _append_message("assistant", _result_summary(result), result)
-    if result.sql_executed:
-        _load_sql_into_console(result.sql_executed)
-        _log_query(result)
-        st.session_state.last_query_sql = result.sql_executed
-    st.session_state.last_query_result = result
-
-    if result.success and plan.table_name:
-        st.session_state.current_table = plan.table_name
-        if plan.intent == Intent.CREATE_TABLE and isinstance(result.data, pd.DataFrame):
-            st.session_state.table_editor_df = result.data.copy()
-            st.session_state.table_editor_table = plan.table_name
-            st.session_state.table_editor_version += 1
-        elif st.session_state.current_database and _engine().mysql.table_exists(plan.table_name):
-            _refresh_table_editor(plan.table_name)
-    _sync_session_context()
-
-
-def _render_execution_result(result: ExecutionResult) -> None:
-    if result is None or result.data is None:
-        return
-    if isinstance(result.data, pd.DataFrame):
-        st.dataframe(result.data, use_container_width=True)
-        _render_result_downloads(result.data)
-        return
-
-    try:
-        import plotly.graph_objects as go
-    except ImportError:  # pragma: no cover
-        return
-    if isinstance(result.data, go.Figure):
-        st.plotly_chart(result.data, use_container_width=True)
-
-
-def _result_summary(result: ExecutionResult) -> str:
-    if not result.success:
-        return result.error or result.message or "The command failed."
-    if result.message:
-        return result.message
-    if result.sql_executed:
-        return "SQL command executed."
-    return "Done."
-
-
-def _append_message(role: str, content: str, result: ExecutionResult | None = None) -> None:
-    st.session_state.messages.append(
-        {
-            "role": role,
-            "content": content,
-            "result": result,
-        }
-    )
-
-
-def _log_query(result: ExecutionResult) -> None:
-    if not result.sql_executed:
-        return
-    st.session_state.query_log.append(
-        {
-            "ts": datetime.now().strftime("%H:%M:%S"),
-            "sql": result.sql_executed,
-            "ok": result.success,
-        }
-    )
-
-
-def _push_sql_history(sql: str) -> None:
-    command = sql.strip()
-    if not command:
-        return
-    history = st.session_state.sql_history
-    if not history or history[-1] != command:
-        history.append(command)
-    st.session_state.sql_history_index = len(history)
-
-
-def _load_previous_command() -> None:
-    history = st.session_state.sql_history
-    if not history:
-        return
-    next_index = st.session_state.sql_history_index - 1
-    if next_index < 0:
-        next_index = 0
-    st.session_state.sql_history_index = next_index
-    _load_sql_into_console(history[next_index])
-
-
-def _load_next_command() -> None:
-    history = st.session_state.sql_history
-    if not history:
-        _load_sql_into_console("")
-        return
-    next_index = st.session_state.sql_history_index + 1
-    if next_index >= len(history):
-        st.session_state.sql_history_index = len(history)
-        _load_sql_into_console("")
-        return
-    st.session_state.sql_history_index = next_index
-    _load_sql_into_console(history[next_index])
-
-
-def _load_sql_into_console(sql: str) -> None:
-    st.session_state.sql_console_text = sql
-    st.session_state.sql_console_version += 1
-
-
-def _append_sql_keyword(keyword: str) -> None:
-    current = st.session_state.sql_console_text.rstrip()
-    spacer = " " if current and not current.endswith((" ", "\n")) else ""
-    _load_sql_into_console(f"{current}{spacer}{keyword}")
-
-
-def _looks_like_sql(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    upper = stripped.upper()
-    return upper.startswith(SQL_COMMAND_PREFIXES)
-
-
-def _suggest_sql_keywords(text: str) -> list[str]:
-    stripped = text.strip()
-    if not stripped:
-        return SQL_KEYWORDS[:8]
-    token_match = re.findall(r"[A-Za-z_]+", stripped.upper())
-    prefix = ""
-    if token_match and not stripped.endswith((" ", "\n")):
-        prefix = token_match[-1]
-    if not prefix:
-        return SQL_KEYWORDS[:8]
-    matches = [keyword for keyword in SQL_KEYWORDS if keyword.startswith(prefix)]
-    return matches[:8] or SQL_KEYWORDS[:4]
-
-
-def _sync_context_after_sql(sql: str, result: ExecutionResult) -> None:
-    _sync_session_context()
-    st.session_state.current_database = _engine().mysql.current_database
-
-    normalized = sql.strip().upper()
-    if normalized.startswith("USE "):
-        st.session_state.current_table = ""
-        st.session_state.table_editor_table = ""
-        st.session_state.table_editor_df = pd.DataFrame()
-        return
-
-    table_name = _extract_table_name_from_sql(sql)
-    if not table_name:
-        return
-
-    if normalized.startswith("DROP TABLE"):
-        if st.session_state.current_table.lower() == table_name.lower():
-            st.session_state.current_table = ""
-            st.session_state.table_editor_table = ""
-            st.session_state.table_editor_df = pd.DataFrame()
-        return
-
-    if result.success and st.session_state.current_database and _engine().mysql.table_exists(table_name):
-        st.session_state.current_table = table_name
-        try:
-            _refresh_table_editor(table_name)
-        except Exception:
-            pass
-
-
-def _extract_table_name_from_sql(sql: str) -> str:
-    patterns = [
-        r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([a-zA-Z0-9_]+)`?",
-        r"INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?",
-        r"UPDATE\s+`?([a-zA-Z0-9_]+)`?",
-        r"DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?",
-        r"ALTER\s+TABLE\s+`?([a-zA-Z0-9_]+)`?",
-        r"TRUNCATE\s+TABLE\s+`?([a-zA-Z0-9_]+)`?",
-        r"DROP\s+TABLE(?:\s+IF\s+EXISTS)?\s+`?([a-zA-Z0-9_]+)`?",
-        r"DESCRIBE\s+`?([a-zA-Z0-9_]+)`?",
-        r"FROM\s+`?([a-zA-Z0-9_]+)`?",
-        r"JOIN\s+`?([a-zA-Z0-9_]+)`?",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return ""
-
-
-def _refresh_table_editor(table_name: str) -> None:
-    df = _engine().mysql.fetch_table(table_name)
-    st.session_state.current_table = table_name
-    st.session_state.table_editor_table = table_name
-    st.session_state.table_editor_df = df.copy()
-    st.session_state.table_editor_version += 1
-
-
-def _clear_chat_history(*, reset_sql_data: bool) -> None:
-    st.session_state.messages = []
-    st.session_state.pending_plan = None
-    _engine().clear_history()
-
-    if reset_sql_data:
-        result = _reset_current_database_data()
-        if result.success:
-            _set_status("success", result.message)
-        else:
-            _set_status("error", result.error or result.message)
-    else:
-        _set_status("success", "Chat history cleared. SQL data was kept.")
-
-
-def _reset_current_database_data() -> ExecutionResult:
-    current_db = st.session_state.current_database.strip()
-    if not current_db:
-        st.session_state.current_table = ""
-        st.session_state.table_editor_table = ""
-        st.session_state.table_editor_df = pd.DataFrame()
-        return ExecutionResult(success=True, message="Chat history cleared. There was no active database to reset.")
-
-    if current_db.lower() in SYSTEM_DATABASES:
-        _engine().mysql.clear_context()
-        st.session_state.current_database = _engine().mysql.current_database
-        st.session_state.current_table = ""
-        st.session_state.table_editor_table = ""
-        st.session_state.table_editor_df = pd.DataFrame()
-        return ExecutionResult(
-            success=True,
-            message=f"Chat history cleared. System database `{current_db}` was kept for safety.",
-        )
-
-    result = _engine().mysql.execute_sql(f"DROP DATABASE `{current_db}`;")
-    if result.success:
-        _engine().mysql.clear_context()
-        st.session_state.current_database = _engine().mysql.current_database
-        st.session_state.current_table = ""
-        st.session_state.table_editor_table = ""
-        st.session_state.table_editor_df = pd.DataFrame()
-        st.session_state.last_query_result = None
-        st.session_state.last_query_sql = ""
-        st.session_state.sql_history = []
-        st.session_state.sql_history_index = -1
-        _load_sql_into_console("")
-        return ExecutionResult(
-            success=True,
-            message=f"Chat history cleared and database `{current_db}` was dropped.",
-        )
-    return result
-
-
-def _render_export_buttons(table_name: str) -> None:
-    try:
-        df = _engine().mysql.fetch_table(table_name)
-    except Exception as exc:
-        st.error(str(exc))
-        return
-
-    csv_data = df.to_csv(index=False).encode("utf-8")
-    excel_buffer = io.BytesIO()
-    df.to_excel(excel_buffer, index=False)
-    st.download_button(
-        "Download CSV",
-        data=csv_data,
-        file_name=f"{table_name}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key=f"download_csv_{table_name}",
-    )
-    st.download_button(
-        "Download Excel",
-        data=excel_buffer.getvalue(),
-        file_name=f"{table_name}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        key=f"download_excel_{table_name}",
-    )
-
-
-def _render_result_downloads(df: pd.DataFrame) -> None:
-    col_csv, col_excel = st.columns(2)
-    with col_csv:
-        st.download_button(
-            "Result CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="query_result.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key=f"result_csv_{len(df)}_{list(df.columns)}",
-        )
-    with col_excel:
-        buffer = io.BytesIO()
-        df.to_excel(buffer, index=False)
-        st.download_button(
-            "Result Excel",
-            data=buffer.getvalue(),
-            file_name="query_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key=f"result_excel_{len(df)}_{list(df.columns)}",
-        )
-
-
-def _run_console_sql() -> None:
-    command = st.session_state.sql_console_text.strip()
-    if not command:
-        _set_status("error", "Type a SQL command first.")
-        return
-    result = _execute_sql_command(command)
-    if result.success:
-        _set_status("success", result.message)
-    else:
-        _set_status("error", result.error or result.message)
-
-
-def _set_status(kind: str, message: str) -> None:
-    st.session_state.status_banner = {"kind": kind, "message": message}
-
-
-def _render_excel_tools() -> None:
-    st.markdown("**Excel Import / Export**")
-
-    uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "xls"])
-    if uploaded and st.session_state.current_database:
-        excel_service = _engine().excel
-        tmp = Path(tempfile.gettempdir()) / uploaded.name
-        tmp.write_bytes(uploaded.read())
-
-        sheets = excel_service.list_sheets(tmp)
-        sheet = st.selectbox("Sheet", sheets, key="excel_sheet_select")
-        df = excel_service.read_sheet(tmp, sheet)
-        st.dataframe(df, use_container_width=True)
-
-        table_name = st.text_input("Import into table", value=sheet.lower(), key="excel_import_table")
-        if st.button("Import sheet into current database", key="excel_import_btn", use_container_width=True):
-            with st.spinner("Importing..."):
-                result = _engine().mysql.import_dataframe(table_name, df, if_exists="replace")
-            if result.success:
-                _log_query(result)
-                st.session_state.last_query_result = result
-                st.session_state.last_query_sql = result.sql_executed
-                _set_status("success", result.message)
-            else:
-                _set_status("error", result.error or result.message)
-            st.rerun()
-
-    if not st.session_state.current_database:
-        st.info("Select a database first if you want to import Excel sheets into MySQL.")
-
-
-def _inject_css() -> None:
+# ── Themes ────────────────────────────────────────────────────────────────────
+
+_DARK = {
+    "--bg":          "#1a1a2e",
+    "--bg2":         "#16213e",
+    "--bg3":         "#0f3460",
+    "--card":        "#1e2a45",
+    "--border":      "#2d3f5e",
+    "--text":        "#e0e6f0",
+    "--text2":       "#8b9dc3",
+    "--accent":      "#e94560",
+    "--accent2":     "#0f7df7",
+    "--success":     "#2ecc71",
+    "--warning":     "#f39c12",
+    "--user-bubble": "#0f7df7",
+    "--bot-bubble":  "#1e2a45",
+    "--bot-text":    "#e0e6f0",
+    "--shadow":      "rgba(0,0,0,0.4)",
+}
+
+_LIGHT = {
+    "--bg":          "#f5f7fa",
+    "--bg2":         "#ffffff",
+    "--bg3":         "#e8edf5",
+    "--card":        "#ffffff",
+    "--border":      "#dde3ee",
+    "--text":        "#1a2033",
+    "--text2":       "#5a6580",
+    "--accent":      "#d63031",
+    "--accent2":     "#0984e3",
+    "--success":     "#00b894",
+    "--warning":     "#e17055",
+    "--user-bubble": "#0984e3",
+    "--bot-bubble":  "#f0f3f8",
+    "--bot-text":    "#1a2033",
+    "--shadow":      "rgba(0,0,0,0.08)",
+}
+
+
+def _css_vars(theme: dict) -> str:
+    return ":root {" + "".join(f"{k}:{v};" for k, v in theme.items()) + "}"
+
+
+def _inject_css(theme: dict) -> None:
     st.markdown(
-        """
-        <style>
-            .stButton > button {
-                border-radius: 10px;
-                border: 1px solid rgba(128, 128, 128, 0.28);
-            }
-            .stChatMessage {
-                border-radius: 14px;
-                border: 1px solid rgba(128, 128, 128, 0.18);
-            }
-            code {
-                font-size: 13px;
-            }
-        </style>
+        f"""
+<style>
+{_css_vars(theme)}
+
+/* ── global ── */
+html, body, [class*="css"] {{
+    background-color: var(--bg) !important;
+    color: var(--text) !important;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+}}
+#MainMenu, footer, header {{ visibility: hidden; }}
+
+/* ── sidebar ── */
+[data-testid="stSidebar"] {{
+    background-color: var(--bg2) !important;
+    border-right: 1px solid var(--border);
+}}
+[data-testid="stSidebar"] .block-container {{ padding-top: 1.2rem; }}
+
+/* ── buttons ── */
+.stButton > button {{
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13px;
+    transition: all .15s;
+}}
+.stButton > button:hover {{
+    background: var(--accent2);
+    color: #fff;
+    border-color: var(--accent2);
+}}
+[data-testid="stDownloadButton"] > button {{
+    border-radius: 8px; font-size: 13px;
+}}
+
+/* ── chat bubbles ── */
+.bubble-user {{
+    background: var(--user-bubble);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 18px 18px 4px 18px;
+    margin: 6px 0 6px auto;
+    max-width: 78%;
+    font-size: 14.5px;
+    line-height: 1.5;
+    box-shadow: 0 2px 8px var(--shadow);
+    word-wrap: break-word;
+}}
+.bubble-bot {{
+    background: var(--bot-bubble);
+    color: var(--bot-text);
+    padding: 10px 16px;
+    border-radius: 18px 18px 18px 4px;
+    margin: 6px auto 6px 0;
+    max-width: 85%;
+    font-size: 14.5px;
+    line-height: 1.5;
+    border: 1px solid var(--border);
+    box-shadow: 0 2px 8px var(--shadow);
+    word-wrap: break-word;
+}}
+.bubble-error {{
+    background: #fff0f0;
+    color: #c0392b;
+    border: 1px solid #f5c6cb;
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 13.5px;
+    margin: 4px 0;
+}}
+
+/* ── cards ── */
+.stat-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+}}
+
+/* ── inputs ── */
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] select,
+textarea {{
+    background: var(--bg3) !important;
+    color: var(--text) !important;
+    border-color: var(--border) !important;
+    border-radius: 8px !important;
+}}
+
+/* ── expanders ── */
+[data-testid="stExpander"] {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}}
+
+/* ── dataframe ── */
+[data-testid="stDataFrame"] {{ border-radius: 10px; overflow: hidden; }}
+
+/* ── chat input ── */
+[data-testid="stChatInput"] textarea {{
+    background: var(--bg3) !important;
+    color: var(--text) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: 12px !important;
+}}
+</style>
         """,
         unsafe_allow_html=True,
     )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run_streamlit_app() -> None:
+    st.set_page_config(
+        page_title="Data Assistant",
+        page_icon="🧠",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    _init_session()
+    _inject_css(_DARK if st.session_state.dark_mode else _LIGHT)
+    _render_header()
+    sidebar_col, main_col = st.columns([1, 3], gap="large")
+    with sidebar_col:
+        _render_sidebar()
+    with main_col:
+        _render_chat_area()
+        _render_table_editor()
+        _render_chat_input()
+
+
+# ── Session ───────────────────────────────────────────────────────────────────
+
+def _init_session() -> None:
+    defaults: dict = {
+        "engine":               None,
+        "dark_mode":            True,
+        "chat":                 [],       # {role, text, result, ts}
+        "pending_plan":         None,
+        "query_log":            [],
+        "current_table":        "",
+        "current_db":           "",
+        "table_editor_df":      pd.DataFrame(),
+        "table_editor_table":   "",
+        "table_editor_version": 0,
+        "prefill":              "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    # Lazy-init engine after config is done
+    if st.session_state.engine is None:
+        st.session_state.engine = DataAssistantEngine()
+
+
+def _eng() -> DataAssistantEngine:
+    return st.session_state.engine
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+def _render_header() -> None:
+    c_title, c_gap, c_theme, c_save, c_clear = st.columns([5, 2, 1.2, 1.4, 1])
+
+    with c_title:
+        st.markdown(
+            "<h2 style='margin:0;padding:0'>🧠 Data Assistant</h2>"
+            "<p style='margin:0;font-size:13px;color:var(--text2)'>"
+            "Type in plain English — I'll convert it to SQL and run it.</p>",
+            unsafe_allow_html=True,
+        )
+
+    with c_gap:
+        if _eng().mysql.ping():
+            tables = _eng().mysql.get_table_names()
+            st.success(
+                f"✅ Connected · {len(tables)} table{'s' if len(tables) != 1 else ''}",
+            )
+        else:
+            st.error("MySQL unreachable")
+            st.stop()
+
+    with c_theme:
+        label = "☀️ Light" if st.session_state.dark_mode else "🌙 Dark"
+        if st.button(label, use_container_width=True):
+            st.session_state.dark_mode = not st.session_state.dark_mode
+            st.rerun()
+
+    with c_save:
+        if st.session_state.chat:
+            st.download_button(
+                "💾 Save chat",
+                data=_export_chat(),
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    with c_clear:
+        if st.button("🗑️ Clear", use_container_width=True):
+            _clear_all()
+            st.rerun()
+
+    st.divider()
+
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+def _render_sidebar() -> None:
+    # ── Connection status ─────────────────────────────────────────────────────
+    st.markdown("### 🗄️ MySQL Explorer")
+
+    # ── Tables list ───────────────────────────────────────────────────────────
+    tables = _eng().mysql.get_table_names()
+    st.markdown(
+        f"<div class='stat-card'><b>Tables</b> &nbsp;"
+        f"<span style='color:var(--text2)'>{len(tables)} found</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    if tables:
+        for t in tables:
+            active = t == st.session_state.current_table
+            label = f"{'▶ ' if active else '  '}📁 {t}"
+            if st.button(label, use_container_width=True, key=f"tbl_{t}"):
+                st.session_state.current_table = t
+                _load_table_editor(t)
+                st.session_state.prefill = f"Show all {t}"
+                st.rerun()
+        if st.button("🔄 Refresh tables", use_container_width=True):
+            st.rerun()
+    else:
+        st.caption("No tables yet — ask me to create one!")
+
+    st.divider()
+
+    # ── Quick example prompts ─────────────────────────────────────────────────
+    st.markdown("#### 💡 Example commands")
+    examples = [
+        ("📋 List tables",            "Show all tables"),
+        ("🏗️ Create table",          "Create a students table with name, cgpa, and branch"),
+        ("➕ Insert rows",            "Insert 5 students with random data"),
+        ("🔍 Query",                  "Show all students ordered by cgpa descending"),
+        ("📊 Chart",                  "Show me a bar chart of students by cgpa"),
+        ("🗑️ Delete",                "Delete students with cgpa less than 6"),
+        ("📝 Describe",              "Describe the schema of students"),
+        ("📤 Export to Excel",        "Export students to Excel"),
+    ]
+    for label, cmd in examples:
+        if st.button(label, use_container_width=True, key=f"ex_{cmd}"):
+            st.session_state.prefill = cmd
+            st.rerun()
+
+    st.divider()
+
+    # ── Excel upload ──────────────────────────────────────────────────────────
+    st.markdown("#### 📂 Excel")
+    uploaded = st.file_uploader(
+        "Upload Excel",
+        type=["xlsx", "xls"],
+        label_visibility="collapsed",
+        key="excel_upload",
+    )
+    if uploaded:
+        tmp = Path(tempfile.gettempdir()) / uploaded.name
+        tmp.write_bytes(uploaded.read())
+        excel_svc = _eng().excel
+        sheets = excel_svc.list_sheets(tmp)
+        sheet = st.selectbox("Sheet", sheets, key="xl_sheet")
+        df = excel_svc.read_sheet(tmp, sheet)
+        st.caption(f"{len(df)} rows · {len(df.columns)} cols")
+
+        with st.expander("Preview", expanded=False):
+            st.dataframe(df.head(6), hide_index=True, use_container_width=True)
+
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button(
+            "⬇️ Download",
+            data=buf.getvalue(),
+            file_name=f"{Path(uploaded.name).stem}_{sheet}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        tbl_name = st.text_input("Import to MySQL as", value=sheet.lower(), key="xl_tbl")
+        if st.button("⬆️ Import to MySQL", type="primary", use_container_width=True):
+            with st.spinner("Importing…"):
+                n = _eng().sync.excel_to_mysql(tmp, tbl_name, sheet)
+            st.success(f"Imported {n} rows → `{tbl_name}`")
+            _add("assistant",
+                 f"Imported **{n} rows** from `{uploaded.name}` into MySQL table `{tbl_name}`.")
+            st.rerun()
+
+    if tables:
+        with st.expander("Export table → Excel", expanded=False):
+            tbl = st.selectbox("Table", tables, key="exp_tbl")
+            if st.button("⬇️ Export", use_container_width=True):
+                out = Path(tempfile.gettempdir()) / f"{tbl}_export.xlsx"
+                _eng().sync.mysql_to_excel(tbl, out)
+                st.download_button(
+                    f"Download {tbl}.xlsx",
+                    data=out.read_bytes(),
+                    file_name=f"{tbl}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+    st.divider()
+
+    # ── Query history ─────────────────────────────────────────────────────────
+    log = st.session_state.query_log
+    if log:
+        with st.expander(f"📜 History ({len(log)})", expanded=False):
+            dump = "\n\n".join(
+                f"-- {e['ts']} {'OK' if e['ok'] else 'FAIL'}\n{e['sql']}" for e in log
+            )
+            st.download_button(
+                "⬇️ Download .sql",
+                data=dump,
+                file_name="queries.sql",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            for e in reversed(log[-15:]):
+                icon = "✅" if e["ok"] else "❌"
+                with st.expander(f"{icon} {e['ts']} — {e['sql'][:40]}…", expanded=False):
+                    st.code(e["sql"], language="sql")
+                    ca, cb = st.columns(2)
+                    if cb.button("▶️ Re-run", key=f"rr_{e['ts']}{e['sql'][:6]}",
+                                 use_container_width=True):
+                        r = _eng().execute_raw(e["sql"])
+                        _log(r)
+                        _add("assistant", _friendly(r), r)
+                        st.rerun()
+
+
+# ── Chat area ─────────────────────────────────────────────────────────────────
+
+def _render_chat_area() -> None:
+    import plotly.graph_objects as go
+
+    if not st.session_state.chat:
+        st.markdown(
+            """
+<div style="text-align:center;padding:60px 0 30px;">
+    <div style="font-size:56px">🗄️</div>
+    <div style="font-size:22px;font-weight:700;margin-top:12px">
+        Ask me anything about your data
+    </div>
+    <div style="font-size:14px;margin-top:8px;color:var(--text2)">
+        Type naturally below — "show all students" · "create a sales table" · "bar chart of expenses"
+    </div>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    for turn in st.session_state.chat:
+        role = turn["role"]
+        text = turn["text"]
+        result: ExecutionResult | None = turn.get("result")
+
+        if role == "user":
+            st.markdown(f'<div class="bubble-user">{text}</div>', unsafe_allow_html=True)
+        else:
+            if turn.get("error"):
+                st.markdown(
+                    f'<div class="bubble-error">⚠️ {turn["error"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(f'<div class="bubble-bot">{text}</div>', unsafe_allow_html=True)
+
+            # SQL (collapsed — not scary for normal users)
+            if result and result.sql_executed:
+                with st.expander("🔍 See the SQL that ran", expanded=False):
+                    st.code(result.sql_executed, language="sql")
+
+            # Data / chart
+            if result and result.data is not None:
+                if isinstance(result.data, pd.DataFrame) and not result.data.empty:
+                    st.dataframe(result.data, use_container_width=True, hide_index=True)
+                    buf = io.BytesIO()
+                    result.data.to_excel(buf, index=False)
+                    st.download_button(
+                        "⬇️ Download result as Excel",
+                        data=buf.getvalue(),
+                        file_name="result.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{turn['ts']}_{id(result)}",
+                    )
+                elif isinstance(result.data, go.Figure):
+                    st.plotly_chart(result.data, use_container_width=True)
+
+            if result and result.error:
+                st.error(result.error)
+
+    # Destructive confirmation
+    if st.session_state.pending_plan is not None:
+        plan = st.session_state.pending_plan
+        st.warning(
+            f"⚠️ This will **{plan.intent.value.upper()}** on `{plan.table_name}`. "
+            "This can't be undone — are you sure?",
+            icon="⚠️",
+        )
+        cy, cn = st.columns(2)
+        if cy.button("✅ Yes, go ahead", type="primary", use_container_width=True):
+            result = _eng().execute(plan)
+            _handle(plan, result)
+            st.session_state.pending_plan = None
+            st.rerun()
+        if cn.button("❌ Cancel", use_container_width=True):
+            _add("assistant", "OK, cancelled. Nothing was changed.")
+            st.session_state.pending_plan = None
+            st.rerun()
+
+
+# ── Table editor ──────────────────────────────────────────────────────────────
+
+def _render_table_editor() -> None:
+    current = st.session_state.current_table
+    with st.expander(
+        f"📝 Table Editor{f'  —  `{current}`' if current else ''}",
+        expanded=bool(current),
+    ):
+        if not current:
+            st.info("Click a table on the left to open it here.")
+            return
+
+        if st.session_state.table_editor_table != current:
+            _load_table_editor(current)
+
+        cr, cs = st.columns(2)
+        if cr.button("🔄 Reload", use_container_width=True):
+            _load_table_editor(current)
+            st.rerun()
+
+        key = f"te_{current}_{st.session_state.table_editor_version}"
+        edited = st.data_editor(
+            st.session_state.table_editor_df,
+            key=key,
+            num_rows="dynamic",
+            use_container_width=True,
+        )
+        st.session_state.table_editor_df = edited
+
+        if cs.button("💾 Save to MySQL", type="primary", use_container_width=True):
+            r = _eng().mysql.replace_table_data(current, edited)
+            _log(r)
+            if r.success:
+                _add("assistant", f"Saved edits to `{current}` ✔", r)
+                _load_table_editor(current)
+                st.rerun()
+            else:
+                st.error(r.error or "Save failed.")
+
+
+# ── Chat input ────────────────────────────────────────────────────────────────
+
+def _render_chat_input() -> None:
+    prefill = st.session_state.pop("prefill", "") or ""
+    blocked = st.session_state.pending_plan is not None
+
+    prompt = st.chat_input(
+        "Type in plain English — e.g. 'show all students' or 'create a products table'",
+        disabled=blocked,
+    )
+
+    if prefill and not blocked:
+        _process(prefill)
+        st.rerun()
+    if prompt and not blocked:
+        _process(prompt)
+        st.rerun()
+
+
+# ── Command processing ────────────────────────────────────────────────────────
+
+def _process(command: str) -> None:
+    _add("user", command)
+    with st.spinner("Thinking…"):
+        try:
+            plan = _eng().parse(command, default_table=st.session_state.current_table)
+        except TypeError:
+            plan = _eng().parse(command)
+
+    if plan.is_destructive:
+        st.session_state.pending_plan = plan
+        _add(
+            "assistant",
+            f"Just checking — this will **{plan.intent.value.replace('_', ' ')}** "
+            f"on `{plan.table_name or st.session_state.current_table}`. "
+            "Confirm below if you want to go ahead.",
+        )
+        return
+
+    with st.spinner("Running…"):
+        result = _eng().execute(plan)
+    _handle(plan, result)
+
+
+def _handle(plan, result: ExecutionResult) -> None:
+    _log(result)
+    _add("assistant", _friendly(result), result)
+
+    if not result.success:
+        return
+    if plan.table_name:
+        st.session_state.current_table = plan.table_name
+    if plan.intent in {Intent.SELECT, Intent.INSERT, Intent.UPDATE,
+                       Intent.DELETE, Intent.DESCRIBE, Intent.CREATE_TABLE}:
+        if st.session_state.current_table:
+            try:
+                _load_table_editor(st.session_state.current_table)
+            except Exception:
+                pass
+
+
+def _friendly(result: ExecutionResult) -> str:
+    import plotly.graph_objects as go
+    if not result.success:
+        return f"Something went wrong: {result.error or result.message}"
+    if isinstance(result.data, pd.DataFrame):
+        n = len(result.data)
+        if n == 0:
+            return "Query ran OK, but no rows matched — try a different filter?"
+        return f"Here you go — {n} row{'s' if n != 1 else ''} found."
+    if isinstance(result.data, go.Figure):
+        return "Here's your chart! 📊"
+    if result.rows_affected:
+        return f"Done! {result.rows_affected} row{'s' if result.rows_affected != 1 else ''} affected."
+    return result.message or "Done! ✔"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _add(role: str, text: str, result: ExecutionResult | None = None,
+         error: str = "") -> None:
+    st.session_state.chat.append({
+        "role": role,
+        "text": text,
+        "result": result,
+        "error": error,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
+
+
+def _log(result: ExecutionResult) -> None:
+    if result.sql_executed:
+        st.session_state.query_log.append({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "sql": result.sql_executed,
+            "ok": result.success,
+        })
+
+
+def _load_table_editor(table_name: str) -> None:
+    df = _eng().mysql.fetch_table(table_name)
+    st.session_state.table_editor_table = table_name
+    st.session_state.table_editor_df = df.copy()
+    st.session_state.table_editor_version += 1
+    st.session_state.current_table = table_name
+
+
+def _export_chat() -> str:
+    lines = [f"Chat — {datetime.now().strftime('%Y-%m-%d %H:%M')}", "=" * 50, ""]
+    for t in st.session_state.chat:
+        who = "You" if t["role"] == "user" else "Assistant"
+        lines.append(f"[{t.get('ts','')}] {who}: {t['text']}")
+        r = t.get("result")
+        if r and r.sql_executed:
+            lines.append(f"  SQL: {r.sql_executed}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _clear_all() -> None:
+    st.session_state.chat.clear()
+    st.session_state.pending_plan = None
+    st.session_state.query_log.clear()
+    _eng().clear_history()

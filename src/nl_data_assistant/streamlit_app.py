@@ -1,13 +1,16 @@
 """
-streamlit_app.py — Full Streamlit UI for the AI Data Assistant.
+streamlit_app.py — Simple, friendly UI for the AI Data Assistant.
 
-Features:
-- Multi-turn chat with persistent history
-- Live schema sidebar
-- Destructive operation confirmation dialogs
-- Query history export as .sql
-- Excel upload / download
-- Plotly chart rendering
+Key fixes vs old version:
+- BUG FIXED: `run_streamlit_app = _workspace_run_streamlit_app` at the bottom
+  was overriding the entire 575-line function. That line is GONE.
+- Chat is the main focus
+- Excel upload is always visible in the sidebar (not buried in a tab)
+- "Save Chat" button always in the header
+- SQL shown collapsed so non-technical users aren't overwhelmed
+- Friendly, conversational reply text
+- All original features kept: table editor, SQL editor, query history,
+  blueprint builder, Excel import/export, destructive confirmation
 """
 from __future__ import annotations
 
@@ -22,135 +25,153 @@ import streamlit as st
 from nl_data_assistant.models import ExecutionResult, Intent
 from nl_data_assistant.nlp.table_blueprint import TableBlueprint
 from nl_data_assistant.services.engine import DataAssistantEngine
-from nl_data_assistant.streamlit_workspace_app import run_streamlit_app as _workspace_run_streamlit_app
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
 def run_streamlit_app() -> None:
     st.set_page_config(
-        page_title="AI Data Assistant",
-        page_icon="🗄️",
+        page_title="Data Assistant",
+        page_icon="🧠",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-
     _inject_css()
     _init_session()
-
-    st.title("🗄️ AI Data Assistant")
-    st.caption("Talk naturally to your MySQL database and Excel sheets locally.")
-
-    # Layout
-    sidebar_col, main_col = st.columns([1, 3], gap="large")
-
-    with sidebar_col:
-        _render_sidebar()
-
-    with main_col:
-        tab_mysql, tab_excel, tab_history = st.tabs(["💬 MySQL Chat", "📊 Excel", "📜 Query History"])
-        with tab_mysql:
-            _render_mysql_tab()
-        with tab_excel:
-            _render_excel_tab()
-        with tab_history:
-            _render_history_tab()
+    _render_header()
+    _render_body()
 
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ── Session init ──────────────────────────────────────────────────────────────
 
 def _init_session() -> None:
-    if "engine" not in st.session_state:
-        st.session_state.engine = DataAssistantEngine()
-    if "chat" not in st.session_state:
-        st.session_state.chat = []       # list of {role, content, result}
-    if "messages" not in st.session_state:
-        st.session_state.messages = st.session_state.chat
-    if "pending_plan" not in st.session_state:
-        st.session_state.pending_plan = None
-    if "query_log" not in st.session_state:
-        st.session_state.query_log = []  # list of {ts, sql, ok}
-    if "current_table" not in st.session_state:
-        st.session_state.current_table = ""
-    if "blueprint" not in st.session_state:
-        st.session_state.blueprint = None
-    if "table_editor_df" not in st.session_state:
-        st.session_state.table_editor_df = pd.DataFrame()
-    if "table_editor_table" not in st.session_state:
-        st.session_state.table_editor_table = ""
-    if "table_editor_version" not in st.session_state:
-        st.session_state.table_editor_version = 0
-    if "sql_editor_text" not in st.session_state:
-        st.session_state.sql_editor_text = ""
-    if "sql_editor_widget" not in st.session_state:
-        st.session_state.sql_editor_widget = ""
-    if "pending_sql_editor_text" not in st.session_state:
-        st.session_state.pending_sql_editor_text = ""
-    if "sql_result" not in st.session_state:
-        st.session_state.sql_result = None
-    st.session_state.messages = st.session_state.chat
+    defaults = {
+        "engine":               DataAssistantEngine(),
+        "chat":                 [],
+        "pending_plan":         None,
+        "query_log":            [],
+        "current_table":        "",
+        "table_editor_df":      pd.DataFrame(),
+        "table_editor_table":   "",
+        "table_editor_version": 0,
+        "sql_editor_text":      "",
+        "sql_result":           None,
+        "prefill":              "",
+        "blueprint":            None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
 
-def _engine() -> DataAssistantEngine:
+def _eng() -> DataAssistantEngine:
     return st.session_state.engine
+
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+def _render_header() -> None:
+    col_title, col_db, col_save, col_clear = st.columns([4, 3, 1.5, 1])
+
+    with col_title:
+        st.markdown("## 🧠 Data Assistant")
+        st.caption("Just talk — I'll handle the SQL.")
+
+    with col_db:
+        if _eng().mysql.ping():
+            tables = _eng().mysql.get_table_names()
+            st.success(
+                f"Connected · {len(tables)} table{'s' if len(tables) != 1 else ''}",
+                icon="✅",
+            )
+        else:
+            st.error("MySQL unreachable — check your .env file", icon="🔴")
+            st.stop()
+
+    with col_save:
+        if st.session_state.chat:
+            st.download_button(
+                "💾 Save chat",
+                data=_build_chat_export(),
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+    with col_clear:
+        if st.button("🗑️ Clear", use_container_width=True):
+            _clear_all()
+            st.rerun()
+
+    st.divider()
+
+
+# ── Body layout ───────────────────────────────────────────────────────────────
+
+def _render_body() -> None:
+    sidebar_col, chat_col = st.columns([1, 3], gap="large")
+    with sidebar_col:
+        _render_sidebar()
+    with chat_col:
+        _render_chat_area()
+        _render_editors()
+        _render_chat_input()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def _render_sidebar() -> None:
-    st.subheader("Database")
 
-    eng = _engine()
-    if eng.mysql.ping():
-        st.success("MySQL connected", icon="✅")
-    else:
-        st.error("MySQL unreachable — check .env", icon="🔴")
-        st.stop()
-
-    # Live schema
-    with st.expander("📋 Schema", expanded=True):
-        tables = eng.mysql.get_table_names()
-        if tables:
-            for t in tables:
-                st.markdown(f"**`{t}`**")
-        else:
-            st.info("No tables yet — create one!")
-
-    if st.button("🔄 Refresh schema"):
-        st.rerun()
-
-    tables = eng.mysql.get_table_names()
-    if tables:
-        selected_table = st.selectbox(
-            "Switch current table",
-            options=[""] + tables,
-            index=([""] + tables).index(st.session_state.current_table)
-            if st.session_state.current_table in tables
-            else 0,
-            key="sidebar_current_table",
-        )
-        if selected_table and selected_table != st.session_state.current_table:
-            st.session_state.current_table = selected_table
-            _load_table_into_editor(selected_table)
+    # Quick examples
+    st.markdown("#### 💡 Try these")
+    examples = [
+        ("📋 List all tables",       "Show all tables"),
+        ("🏗️ Create students table", "Create a students table with name, cgpa, and branch"),
+        ("➕ Add sample rows",       "Insert 5 students with random data"),
+        ("🔍 Show students",         "Show all students ordered by cgpa desc"),
+        ("📊 Bar chart",             "Show me a bar chart of students"),
+        ("🗑️ Delete low CGPA",      "Delete students with cgpa less than 6"),
+        ("📝 Describe table",        "Describe the schema of students"),
+    ]
+    for label, cmd in examples:
+        if st.button(label, use_container_width=True, key=f"ex_{cmd}"):
+            st.session_state.prefill = cmd
             st.rerun()
 
-    with st.expander("Add your own table", expanded=not tables):
-        with st.form("create_table_form"):
-            table_name = st.text_input("Table name", placeholder="students")
-            columns_text = st.text_input(
-                "Columns",
-                placeholder="name, cgpa, branch",
-                help="Comma-separated column names. Types are inferred locally.",
-            )
-            recreate = st.checkbox("Replace table if it already exists")
-            create_table = st.form_submit_button("Create table", use_container_width=True)
+    st.divider()
 
-        if create_table:
-            blueprint = _blueprint_from_inputs(table_name, columns_text)
+    # Your tables
+    st.markdown("#### 🗄️ Your tables")
+    tables = _eng().mysql.get_table_names()
+    if tables:
+        for t in tables:
+            if st.button(f"  📁 {t}", use_container_width=True, key=f"tbl_{t}"):
+                st.session_state.prefill = f"Show all {t}"
+                st.rerun()
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+    else:
+        st.caption("No tables yet. Create one by asking!")
+
+    st.divider()
+
+    # Build a table form
+    with st.expander("🏗️ Build a table", expanded=not tables):
+        with st.form("create_table_form", clear_on_submit=True):
+            tname = st.text_input("Table name", placeholder="students")
+            tcols = st.text_input("Columns", placeholder="name, cgpa, branch")
+            recreate = st.checkbox("Replace if already exists")
+            submitted = st.form_submit_button(
+                "Create", use_container_width=True, type="primary"
+            )
+        if submitted:
+            blueprint = _blueprint_from_inputs(tname, tcols)
             if blueprint is None:
-                st.error("Enter a table name and at least one column.")
+                st.error("Fill in both a name and at least one column.")
             else:
-                result = eng.mysql.create_table_from_blueprint(blueprint, recreate=recreate)
+                result = _eng().mysql.create_table_from_blueprint(
+                    blueprint, recreate=recreate
+                )
                 if result.success:
                     st.session_state.current_table = blueprint["table_name"]
                     st.session_state.blueprint = blueprint
@@ -160,114 +181,301 @@ def _render_sidebar() -> None:
                         pd.DataFrame(blueprint.get("sample_data") or []),
                     )
                     _log_query(result)
-                    _append_turn(
+                    _append(
                         "assistant",
-                        (
-                            f"Created table `{blueprint['table_name']}` from the table builder. "
-                            "Edit the starter rows in the table editor and save when ready."
-                        ),
+                        f"Done! Created table `{blueprint['table_name']}`. "
+                        "You can edit rows in the Table Editor below and save when ready.",
                         result,
                     )
                     st.rerun()
                 else:
-                    st.error(result.error or "Could not create the table.")
+                    st.error(result.error or "Couldn't create the table.")
 
     st.divider()
 
-    # Example prompts
-    st.subheader("Try these")
-    examples = [
-        "Create a students table with name, cgpa, and branch",
-        "Insert 5 students with random data",
-        "Show all students ordered by cgpa desc",
-        "Delete students with cgpa less than 6",
-        "Show me a bar chart of students",
-        "Export students to Excel",
-    ]
-    for ex in examples:
-        if st.button(ex, use_container_width=True):
-            st.session_state["_prefill"] = ex
+    # Excel section — always visible
+    st.markdown("#### 📂 Excel")
+    uploaded = st.file_uploader(
+        "Upload an Excel file",
+        type=["xlsx", "xls"],
+        label_visibility="collapsed",
+        key="excel_upload",
+    )
+
+    if uploaded:
+        tmp = Path(tempfile.gettempdir()) / uploaded.name
+        tmp.write_bytes(uploaded.read())
+        excel_svc = _eng().excel
+        sheets = excel_svc.list_sheets(tmp)
+        sheet = st.selectbox("Sheet", sheets, key="excel_sheet")
+        df = excel_svc.read_sheet(tmp, sheet)
+
+        st.caption(f"{len(df)} rows · {len(df.columns)} cols")
+
+        with st.expander("Preview", expanded=False):
+            st.dataframe(df.head(8), hide_index=True, use_container_width=True)
+
+        buf = io.BytesIO()
+        df.to_excel(buf, index=False)
+        st.download_button(
+            "⬇️ Download",
+            data=buf.getvalue(),
+            file_name=f"{Path(uploaded.name).stem}_{sheet}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        tbl_name = st.text_input(
+            "Save to MySQL table as", value=sheet.lower(), key="excel_tbl"
+        )
+        if st.button("⬆️ Import to MySQL", use_container_width=True, type="primary"):
+            with st.spinner("Importing…"):
+                n = _eng().sync.excel_to_mysql(tmp, tbl_name, sheet)
+            st.success(f"Imported {n} rows into `{tbl_name}`!")
+            _append(
+                "assistant",
+                f"Imported **{n} rows** from `{uploaded.name}` into MySQL table `{tbl_name}`.",
+            )
             st.rerun()
 
+    # Export MySQL → Excel
+    if tables:
+        with st.expander("Export table → Excel", expanded=False):
+            tbl = st.selectbox("Table to export", tables, key="export_tbl")
+            if st.button("⬇️ Export", use_container_width=True):
+                out = Path(tempfile.gettempdir()) / f"{tbl}_export.xlsx"
+                _eng().sync.mysql_to_excel(tbl, out)
+                st.download_button(
+                    f"Download {tbl}.xlsx",
+                    data=out.read_bytes(),
+                    file_name=f"{tbl}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
     st.divider()
-    if st.button("🗑️ Clear chat history"):
-        st.session_state.chat.clear()
-        st.session_state.messages = st.session_state.chat
-        _engine().clear_history()
-        st.session_state.pending_plan = None
-        st.session_state.sql_editor_text = ""
-        st.session_state.sql_editor_widget = ""
-        st.session_state.pending_sql_editor_text = ""
-        st.session_state.sql_result = None
-        st.rerun()
+
+    # Query history (compact, in sidebar)
+    log = st.session_state.query_log
+    if log:
+        with st.expander(f"📜 Query history ({len(log)})", expanded=False):
+            sql_dump = "\n\n".join(
+                f"-- {e['ts']} {'OK' if e['ok'] else 'FAILED'}\n{e['sql']}"
+                for e in log
+            )
+            st.download_button(
+                "⬇️ Download .sql",
+                data=sql_dump,
+                file_name="session_queries.sql",
+                mime="text/plain",
+                use_container_width=True,
+            )
+            for entry in reversed(log[-20:]):
+                icon = "✅" if entry["ok"] else "❌"
+                with st.expander(
+                    f"{icon} {entry['ts']} — {entry['sql'][:45]}…", expanded=False
+                ):
+                    st.code(entry["sql"], language="sql")
+                    c1, c2 = st.columns(2)
+                    if c1.button(
+                        "✏️ Edit",
+                        key=f"edit_{entry['ts']}_{entry['sql'][:8]}",
+                        use_container_width=True,
+                    ):
+                        _set_sql_editor(entry["sql"])
+                        st.rerun()
+                    if c2.button(
+                        "▶️ Re-run",
+                        key=f"rerun_{entry['ts']}_{entry['sql'][:8]}",
+                        use_container_width=True,
+                    ):
+                        result = _eng().execute_raw(entry["sql"])
+                        _log_query(result)
+                        _append("assistant", _result_summary(result), result)
+                        st.rerun()
 
 
-# ── MySQL Chat tab ────────────────────────────────────────────────────────────
+# ── Chat area ─────────────────────────────────────────────────────────────────
 
-def _render_mysql_tab() -> None:
-    _render_current_table_panel()
-    _render_sql_editor_panel()
+def _render_chat_area() -> None:
+    import plotly.graph_objects as go
 
-    # Render chat history
+    if not st.session_state.chat:
+        st.markdown(
+            """
+            <div style="text-align:center;padding:50px 0 20px;color:#9aa0a6;">
+                <div style="font-size:52px;">🗄️</div>
+                <div style="font-size:20px;font-weight:600;margin-top:10px;color:#3c4043;">
+                    Ask me anything about your data
+                </div>
+                <div style="font-size:14px;margin-top:6px;">
+                    Try "show all students" · "create a sales table" · "bar chart of expenses"
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
     for turn in st.session_state.chat:
         with st.chat_message(turn["role"]):
             st.markdown(turn["content"])
             result: ExecutionResult | None = turn.get("result")
-            if result:
-                _render_result(result)
+            if result and result.data is not None:
+                if isinstance(result.data, pd.DataFrame) and not result.data.empty:
+                    st.dataframe(result.data, use_container_width=True, hide_index=True)
+                    buf = io.BytesIO()
+                    result.data.to_excel(buf, index=False)
+                    st.download_button(
+                        "⬇️ Download as Excel",
+                        data=buf.getvalue(),
+                        file_name="result.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{turn['ts']}_{id(result)}",
+                    )
+                elif isinstance(result.data, go.Figure):
+                    st.plotly_chart(result.data, use_container_width=True)
+            if result and result.error:
+                st.error(result.error)
 
-    # Handle pending destructive confirmation
+    # Destructive confirmation
     if st.session_state.pending_plan is not None:
         plan = st.session_state.pending_plan
         st.warning(
             f"⚠️ This will **{plan.intent.value.upper()}** on `{plan.table_name}`. "
-            "Are you sure?",
+            "Are you sure? This can't be undone.",
             icon="⚠️",
         )
-        col_yes, col_no = st.columns(2)
-        if col_yes.button("✅ Yes, proceed", type="primary"):
-            result = _engine().execute(plan)
-            _handle_execution_result(plan, result)
+        yes_col, no_col = st.columns(2)
+        if yes_col.button("✅ Yes, go ahead", type="primary", use_container_width=True):
+            result = _eng().execute(plan)
+            _handle_result(plan, result)
             st.session_state.pending_plan = None
             st.rerun()
-        if col_no.button("❌ Cancel"):
+        if no_col.button("❌ Cancel", use_container_width=True):
+            _append("assistant", "OK, cancelled. Nothing was changed.")
             st.session_state.pending_plan = None
             st.rerun()
-        return  # block input until confirmed
 
-    # Chat input
-    prefill = st.session_state.pop("_prefill", "")
-    prompt = st.chat_input("Ask anything — e.g. 'show all students ordered by cgpa'")
-    if prefill:
-        prompt = prefill
 
-    if prompt:
-        _append_turn("user", prompt)
-        with st.spinner("Thinking…"):
-            plan = _engine().parse(prompt, default_table=st.session_state.current_table)
+# ── Editors ───────────────────────────────────────────────────────────────────
 
-        if plan.is_destructive:
-            # Destructive — needs confirmation
-            st.session_state.pending_plan = plan
-            _append_turn(
-                "assistant",
-                (
-                    f"This will {plan.intent.value.replace('_', ' ')} "
-                    f"on `{plan.table_name or st.session_state.current_table or 'the selected table'}`. "
-                    "Please confirm to continue."
-                ),
-            )
+def _render_editors() -> None:
+    current = st.session_state.current_table
+
+    # Table editor
+    with st.expander(
+        f"📝 Table Editor{f'  —  `{current}`' if current else ''}",
+        expanded=bool(current),
+    ):
+        if not current:
+            st.info("Select or create a table to edit rows directly here.")
         else:
-            with st.spinner("Running command..."):
-                result = _engine().execute(plan)
-            _handle_execution_result(plan, result)
+            if st.session_state.table_editor_table != current:
+                _load_table_editor(current)
 
+            c_reload, c_save = st.columns(2)
+            if c_reload.button("🔄 Reload from DB", use_container_width=True):
+                _load_table_editor(current)
+                st.rerun()
+
+            editor_key = f"te_{current}_{st.session_state.table_editor_version}"
+            edited = st.data_editor(
+                st.session_state.table_editor_df,
+                key=editor_key,
+                num_rows="dynamic",
+                use_container_width=True,
+            )
+            st.session_state.table_editor_df = edited
+
+            if c_save.button("💾 Save to MySQL", type="primary", use_container_width=True):
+                save_result = _eng().mysql.replace_table_data(current, edited)
+                _log_query(save_result)
+                if save_result.success:
+                    _set_sql_editor(save_result.sql_executed)
+                    _append(
+                        "assistant",
+                        f"Saved your edits back to `{current}` ✔",
+                        save_result,
+                    )
+                    _load_table_editor(current)
+                    st.rerun()
+                else:
+                    st.error(save_result.error or "Save failed.")
+
+    # SQL editor (only shown after a command runs)
+    if st.session_state.sql_editor_text:
+        with st.expander("🔧 SQL Editor — tweak and re-run", expanded=False):
+            sql = st.text_area(
+                "SQL",
+                value=st.session_state.sql_editor_text,
+                height=160,
+                key="sql_editor_widget",
+                label_visibility="collapsed",
+                help="You can edit the generated SQL and run it again.",
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("▶️ Run SQL", type="primary", use_container_width=True):
+                result = _eng().execute_raw(sql)
+                _log_query(result)
+                _append("assistant", _result_summary(result), result)
+                _set_sql_editor(sql)
+                st.rerun()
+            if c2.button("✖ Clear", use_container_width=True):
+                st.session_state.sql_editor_text = ""
+                st.rerun()
+
+
+# ── Chat input ────────────────────────────────────────────────────────────────
+
+def _render_chat_input() -> None:
+    prefill = st.session_state.pop("prefill", "") or ""
+    blocked = st.session_state.pending_plan is not None
+
+    prompt = st.chat_input(
+        "Ask anything — e.g. 'show all students' or 'make a bar chart of expenses'",
+        disabled=blocked,
+    )
+
+    if prefill and not blocked:
+        _process_command(prefill)
+        st.rerun()
+
+    if prompt and not blocked:
+        _process_command(prompt)
         st.rerun()
 
 
-def _handle_execution_result(plan, result: ExecutionResult) -> None:
+# ── Command processing ────────────────────────────────────────────────────────
+
+def _process_command(command: str) -> None:
+    _append("user", command)
+
+    with st.spinner("Thinking…"):
+        try:
+            plan = _eng().parse(command, default_table=st.session_state.current_table)
+        except TypeError:
+            plan = _eng().parse(command)
+
+    if plan.is_destructive:
+        st.session_state.pending_plan = plan
+        _append(
+            "assistant",
+            f"Heads up — this will **{plan.intent.value.replace('_', ' ')}** "
+            f"on `{plan.table_name or st.session_state.current_table or 'the table'}`. "
+            "Confirm below if you want to proceed.",
+        )
+        return
+
+    with st.spinner("Running…"):
+        result = _eng().execute(plan)
+
+    _handle_result(plan, result)
+
+
+def _handle_result(plan, result: ExecutionResult) -> None:
     _log_query(result)
-    _append_turn("assistant", _result_summary(result), result)
+    _append("assistant", _friendly_reply(result), result)
 
     if result.sql_executed:
         _set_sql_editor(result.sql_executed)
@@ -279,121 +487,53 @@ def _handle_execution_result(plan, result: ExecutionResult) -> None:
         st.session_state.current_table = plan.table_name
 
     if plan.intent == Intent.CREATE_TABLE:
-        st.session_state.blueprint = _blueprint_from_command(plan.raw_command, plan.table_name)
-        sample_df = result.data if isinstance(result.data, pd.DataFrame) else pd.DataFrame()
-        _set_table_editor(plan.table_name, sample_df)
+        bp = _blueprint_from_command(plan.raw_command, plan.table_name)
+        st.session_state.blueprint = bp
+        sample = result.data if isinstance(result.data, pd.DataFrame) else pd.DataFrame()
+        _set_table_editor(plan.table_name, sample)
         return
 
     if plan.intent in {
-        Intent.SELECT,
-        Intent.INSERT,
-        Intent.UPDATE,
-        Intent.DELETE,
-        Intent.DESCRIBE,
-    } and st.session_state.current_table:
-        _load_table_into_editor(st.session_state.current_table)
+        Intent.SELECT, Intent.INSERT, Intent.UPDATE,
+        Intent.DELETE, Intent.DESCRIBE,
+    }:
+        if st.session_state.current_table:
+            try:
+                _load_table_editor(st.session_state.current_table)
+            except Exception:
+                pass
 
 
-def _render_current_table_panel() -> None:
-    with st.expander("Table editor", expanded=bool(st.session_state.current_table)):
-        current_table = st.session_state.current_table
-        if not current_table:
-            st.info("Select or create a table to edit it here.")
-            return
-
-        st.caption(f"Editing `{current_table}`")
-
-        if st.session_state.table_editor_table != current_table:
-            _load_table_into_editor(current_table)
-
-        col_reload, col_save = st.columns(2)
-        if col_reload.button("Reload table", use_container_width=True):
-            _load_table_into_editor(current_table)
-            st.rerun()
-
-        editor_key = f"table_editor_widget_{current_table}_{st.session_state.table_editor_version}"
-        edited_df = st.data_editor(
-            st.session_state.table_editor_df,
-            key=editor_key,
-            num_rows="dynamic",
-            use_container_width=True,
-        )
-        st.session_state.table_editor_df = edited_df
-
-        if col_save.button("Save table to MySQL", type="primary", use_container_width=True):
-            save_result = _save_editor_to_mysql(current_table, edited_df)
-            if save_result.success:
-                st.success(save_result.message)
-                st.rerun()
-            else:
-                st.error(save_result.error or save_result.message)
-
-
-def _render_sql_editor_panel() -> None:
-    with st.expander("SQL editor", expanded=bool(st.session_state.sql_editor_text)):
-        if not st.session_state.sql_editor_text:
-            st.info("Run a command first, then edit the generated SQL here.")
-            return
-
-        if st.session_state.pending_sql_editor_text:
-            st.session_state.sql_editor_widget = st.session_state.pending_sql_editor_text
-            st.session_state.pending_sql_editor_text = ""
-        elif not st.session_state.sql_editor_widget:
-            st.session_state.sql_editor_widget = st.session_state.sql_editor_text
-
-        st.text_area(
-            "Editable SQL",
-            key="sql_editor_widget",
-            height=180,
-            help="You can modify the generated SQL and run it again.",
-        )
-        st.session_state.sql_editor_text = st.session_state.sql_editor_widget
-        col_run, col_clear = st.columns(2)
-        if col_run.button("Run edited SQL", type="primary", use_container_width=True):
-            result = _engine().execute_raw(st.session_state.sql_editor_widget)
-            st.session_state.sql_result = result
-            _log_query(result)
-            _append_turn("assistant", _result_summary(result), result)
-            if st.session_state.current_table:
-                try:
-                    _load_table_into_editor(st.session_state.current_table)
-                except Exception:
-                    pass
-            st.rerun()
-        if col_clear.button("Clear SQL", use_container_width=True):
-            st.session_state.sql_editor_text = ""
-            st.session_state.sql_editor_widget = ""
-            st.session_state.pending_sql_editor_text = ""
-            st.session_state.sql_result = None
-            st.rerun()
-
-
-def _render_result(result: ExecutionResult) -> None:
-    if result.error:
-        st.error(result.error)
-        return
-    if result.data is None:
-        return
-
+def _friendly_reply(result: ExecutionResult) -> str:
     import plotly.graph_objects as go
-    if isinstance(result.data, pd.DataFrame):
-        st.dataframe(result.data, use_container_width=True)
-        _download_button(result.data, "result.xlsx")
-    elif isinstance(result.data, go.Figure):
-        st.plotly_chart(result.data, use_container_width=True)
 
-
-def _result_summary(result: ExecutionResult) -> str:
     if not result.success:
-        return result.message or result.error
-    if result.sql_executed:
-        return f"```sql\n{result.sql_executed}\n```\n\n{result.message}"
-    return result.message or "Done."
+        return f"Something went wrong: {result.error or result.message}"
+
+    if isinstance(result.data, pd.DataFrame):
+        n = len(result.data)
+        if n == 0:
+            return "Query ran fine, but got no rows back — the table might be empty or your filter didn't match anything."
+        return f"Here you go — {n} row{'s' if n != 1 else ''} found."
+
+    if isinstance(result.data, go.Figure):
+        return "Here's your chart! 📊"
+
+    if result.rows_affected:
+        return f"Done! {result.rows_affected} row{'s' if result.rows_affected != 1 else ''} affected."
+
+    return result.message or "Done! ✔"
 
 
-def _append_turn(role: str, content: str, result: ExecutionResult | None = None) -> None:
-    st.session_state.chat.append({"role": role, "content": content, "result": result})
-    st.session_state.messages = st.session_state.chat
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _append(role: str, content: str, result: ExecutionResult | None = None) -> None:
+    st.session_state.chat.append({
+        "role": role,
+        "content": content,
+        "result": result,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    })
 
 
 def _log_query(result: ExecutionResult) -> None:
@@ -405,119 +545,8 @@ def _log_query(result: ExecutionResult) -> None:
         })
 
 
-# ── Excel tab ─────────────────────────────────────────────────────────────────
-
-def _render_excel_tab() -> None:
-    st.subheader("Excel Manager")
-
-    uploaded = st.file_uploader("Upload an Excel file", type=["xlsx", "xls"])
-    if uploaded:
-        excel_svc = _engine().excel
-        # Save to a temp path so ExcelService can read it
-        tmp = Path(tempfile.gettempdir()) / uploaded.name
-        tmp.write_bytes(uploaded.read())
-
-        sheets = excel_svc.list_sheets(tmp)
-        sheet = st.selectbox("Sheet", sheets)
-        df = excel_svc.read_sheet(tmp, sheet)
-        st.dataframe(df, use_container_width=True)
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            _download_button(df, f"{Path(uploaded.name).stem}_{sheet}.xlsx")
-        with col_b:
-            table_name = st.text_input("Import to MySQL table", value=sheet.lower())
-            if st.button("⬆️ Import to MySQL"):
-                with st.spinner("Importing…"):
-                    n = _engine().sync.excel_to_mysql(tmp, table_name, sheet)
-                st.success(f"Imported {n} rows into `{table_name}`")
-
-    st.divider()
-    st.subheader("Export MySQL table → Excel")
-    tables = _engine().mysql.get_table_names()
-    if tables:
-        tbl = st.selectbox("Table", tables, key="export_tbl")
-        if st.button("⬇️ Export to Excel"):
-            with st.spinner("Exporting…"):
-                out_path = Path(tempfile.gettempdir()) / f"{tbl}_export.xlsx"
-                _engine().sync.mysql_to_excel(tbl, out_path)
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    label=f"Download {tbl}.xlsx",
-                    data=f.read(),
-                    file_name=f"{tbl}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-    else:
-        st.info("No MySQL tables found to export.")
-
-
-# ── Query history tab ─────────────────────────────────────────────────────────
-
-def _render_history_tab() -> None:
-    log = st.session_state.query_log
-    if not log:
-        st.info("No queries executed yet.")
-        return
-
-    st.subheader(f"Query Log — {len(log)} queries")
-
-    # Export as .sql
-    sql_dump = "\n\n".join(
-        f"-- {entry['ts']} {'OK' if entry['ok'] else 'FAILED'}\n{entry['sql']}"
-        for entry in log
-    )
-    st.download_button(
-        "⬇️ Download as .sql",
-        data=sql_dump,
-        file_name="session_queries.sql",
-        mime="text/plain",
-    )
-
-    st.divider()
-
-    for entry in reversed(log):
-        icon = "✅" if entry["ok"] else "❌"
-        with st.expander(f"{icon} {entry['ts']} — {entry['sql'][:60]}…"):
-            st.code(entry["sql"], language="sql")
-            if st.button(
-                "Edit this SQL",
-                key=f"edit_{entry['ts']}_{entry['sql']}",
-                use_container_width=True,
-            ):
-                _set_sql_editor(entry["sql"])
-                st.rerun()
-            if st.button("▶️ Re-run", key=entry["sql"] + entry["ts"]):
-                result = _engine().execute_raw(entry["sql"])
-                st.session_state.sql_result = result
-                _log_query(result)
-                _append_turn("assistant", _result_summary(result), result)
-                if st.session_state.current_table:
-                    try:
-                        _load_table_into_editor(st.session_state.current_table)
-                    except Exception:
-                        pass
-                st.rerun()
-
-
-# ── Shared helpers ────────────────────────────────────────────────────────────
-
-def _blueprint_from_command(command: str, fallback_table: str = "") -> dict:
-    blueprint = TableBlueprint().generate(command)
-    if fallback_table:
-        blueprint["table_name"] = fallback_table
-    return blueprint
-
-
-def _blueprint_from_inputs(table_name: str, columns_text: str) -> dict | None:
-    clean_name = table_name.strip()
-    clean_columns = columns_text.strip()
-    if not clean_name or not clean_columns:
-        return None
-    return _blueprint_from_command(
-        f"create a table of {clean_name} with {clean_columns}",
-        fallback_table=clean_name,
-    )
+def _set_sql_editor(sql: str) -> None:
+    st.session_state.sql_editor_text = sql
 
 
 def _set_table_editor(table_name: str, df: pd.DataFrame) -> None:
@@ -527,49 +556,74 @@ def _set_table_editor(table_name: str, df: pd.DataFrame) -> None:
     st.session_state.table_editor_version += 1
 
 
-def _load_table_into_editor(table_name: str) -> None:
-    df = _engine().mysql.fetch_table(table_name)
+def _load_table_editor(table_name: str) -> None:
+    df = _eng().mysql.fetch_table(table_name)
     _set_table_editor(table_name, df)
 
 
-def _save_editor_to_mysql(table_name: str, df: pd.DataFrame) -> ExecutionResult:
-    result = _engine().mysql.replace_table_data(table_name, df)
-    if result.success:
-        _log_query(result)
-        _set_sql_editor(result.sql_executed)
-        _append_turn(
-            "assistant",
-            f"Saved the edited rows back to `{table_name}`.\n\n```sql\n{result.sql_executed}\n```",
-            result,
-        )
-        _load_table_into_editor(table_name)
-    return result
+def _result_summary(result: ExecutionResult) -> str:
+    if not result.success:
+        return result.message or result.error or "Failed."
+    msg = _friendly_reply(result)
+    if result.sql_executed:
+        return f"```sql\n{result.sql_executed}\n```\n\n{msg}"
+    return msg
 
 
-def _set_sql_editor(sql: str) -> None:
-    st.session_state.sql_editor_text = sql
-    st.session_state.pending_sql_editor_text = sql
+def _blueprint_from_command(command: str, fallback_table: str = "") -> dict:
+    bp = TableBlueprint().generate(command)
+    if fallback_table:
+        bp["table_name"] = fallback_table
+    return bp
 
 
-def _download_button(df: pd.DataFrame, filename: str) -> None:
-    buf = io.BytesIO()
-    df.to_excel(buf, index=False)
-    st.download_button(
-        label=f"⬇️ Download {filename}",
-        data=buf.getvalue(),
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+def _blueprint_from_inputs(table_name: str, columns_text: str) -> dict | None:
+    name = table_name.strip()
+    cols = columns_text.strip()
+    if not name or not cols:
+        return None
+    return _blueprint_from_command(
+        f"create a table of {name} with {cols}", fallback_table=name
     )
 
 
+def _build_chat_export() -> str:
+    lines = [
+        f"Chat saved on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "=" * 50,
+        "",
+    ]
+    for turn in st.session_state.chat:
+        who = "You" if turn["role"] == "user" else "Assistant"
+        lines.append(f"[{turn.get('ts', '')}] {who}:")
+        lines.append(f"  {turn['content']}")
+        result = turn.get("result")
+        if result and result.sql_executed:
+            lines.append(f"  SQL: {result.sql_executed}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _clear_all() -> None:
+    st.session_state.chat.clear()
+    st.session_state.pending_plan = None
+    st.session_state.sql_editor_text = ""
+    st.session_state.sql_result = None
+    st.session_state.query_log.clear()
+    _eng().clear_history()
+
+
 def _inject_css() -> None:
-    st.markdown("""
-    <style>
-        .stChatMessage { border-radius: 12px; }
-        .stButton > button { border-radius: 8px; }
-        code { font-size: 13px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-run_streamlit_app = _workspace_run_streamlit_app
+    st.markdown(
+        """
+        <style>
+            [data-testid="stChatMessage"] { border-radius: 12px; padding: 4px 0; }
+            .stButton > button { border-radius: 8px; font-size: 13px; }
+            [data-testid="stDownloadButton"] > button { border-radius: 8px; font-size: 13px; }
+            code { font-size: 12px; }
+            #MainMenu, footer { visibility: hidden; }
+            [data-testid="stSidebar"] .block-container { padding-top: 1rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
