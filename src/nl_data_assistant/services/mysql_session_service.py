@@ -25,6 +25,7 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from nl_data_assistant.config import settings
 from nl_data_assistant.models import ActionPlan, ExecutionResult
 from nl_data_assistant.nlp.mysql_query_generator import MySQLQueryGenerator
+from nl_data_assistant.nlp.table_blueprint import TableBlueprint
 
 log = logging.getLogger(__name__)
 
@@ -233,24 +234,47 @@ class MySQLSessionService:
         clean_df = df.copy()
         clean_df.columns = [str(column).strip() for column in clean_df.columns]
 
+        rename_map: dict[str, str] = {}
+        for column_name in clean_df.columns:
+            if column_name not in writable_columns:
+                rename_map[column_name] = _sanitize_identifier(column_name)
+        if rename_map:
+            clean_df = clean_df.rename(columns=rename_map)
+
+        duplicated_columns = clean_df.columns[clean_df.columns.duplicated()].tolist()
+        if duplicated_columns:
+            duplicates = ", ".join(sorted(set(map(str, duplicated_columns))))
+            return ExecutionResult(
+                success=False,
+                error=f"Duplicate column names found after cleaning: {duplicates}.",
+            )
+
         for missing in [name for name in writable_columns if name not in clean_df.columns]:
             clean_df[missing] = None
 
         extra_columns = [name for name in clean_df.columns if name not in writable_columns]
-        if extra_columns:
-            clean_df = clean_df.drop(columns=extra_columns)
-
-        clean_df = clean_df[writable_columns]
+        final_columns = list(writable_columns) + list(extra_columns)
+        clean_df = clean_df[final_columns]
         clean_df = clean_df.where(pd.notnull(clean_df), None)
 
         delete_sql = f"DELETE FROM `{real_table}`;"
-        statements = [f"USE `{target_db}`;", delete_sql]
+        statements = [f"USE `{target_db}`;"]
         try:
             with self._database_engine(target_db).begin() as conn:
+                for column_name in extra_columns:
+                    sql_type = self._infer_series_sql_type(column_name, clean_df[column_name])
+                    alter_sql = (
+                        f"ALTER TABLE `{real_table}` "
+                        f"ADD COLUMN `{column_name}` {sql_type};"
+                    )
+                    conn.exec_driver_sql(alter_sql)
+                    statements.append(alter_sql)
+
+                statements.append(delete_sql)
                 conn.execute(text(delete_sql))
-                if not clean_df.empty and writable_columns:
-                    column_sql = ", ".join(f"`{name}`" for name in writable_columns)
-                    value_sql = ", ".join(f":{name}" for name in writable_columns)
+                if not clean_df.empty and final_columns:
+                    column_sql = ", ".join(f"`{name}`" for name in final_columns)
+                    value_sql = ", ".join(f":{name}" for name in final_columns)
                     insert_sql = (
                         f"INSERT INTO `{real_table}` ({column_sql}) VALUES ({value_sql});"
                     )
@@ -266,6 +290,32 @@ class MySQLSessionService:
         except SQLAlchemyError as exc:
             log.error("Save table data failed: %s", exc)
             return ExecutionResult(success=False, error=str(exc))
+
+    def _infer_series_sql_type(self, column_name: str, series: pd.Series) -> str:
+        non_null = series.dropna()
+        if non_null.empty:
+            return TableBlueprint()._infer_type(column_name)
+
+        if pd.api.types.is_bool_dtype(non_null):
+            return "TINYINT(1)"
+        if pd.api.types.is_integer_dtype(non_null):
+            return "INT"
+        if pd.api.types.is_float_dtype(non_null):
+            return "FLOAT"
+        if pd.api.types.is_datetime64_any_dtype(non_null):
+            return "DATETIME"
+
+        as_text = non_null.astype(str).str.strip()
+        if not as_text.empty and as_text.str.fullmatch(r"-?\d+").all():
+            return "INT"
+        if not as_text.empty and as_text.str.fullmatch(r"-?\d+(\.\d+)?").all():
+            return "FLOAT"
+        if not as_text.empty and as_text.str.fullmatch(
+            r"\d{4}-\d{2}-\d{2}( \d{2}:\d{2}:\d{2})?"
+        ).all():
+            return "DATETIME"
+
+        return TableBlueprint()._infer_type(column_name)
 
     def import_dataframe(
         self,
@@ -292,6 +342,68 @@ class MySQLSessionService:
             )
         except (ValueError, SQLAlchemyError) as exc:
             log.error("DataFrame import failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
+    def rename_table(
+        self,
+        current_table_name: str,
+        new_table_name: str,
+        *,
+        database: str | None = None,
+    ) -> ExecutionResult:
+        target_db = self._require_database(database)
+        real_current = self._match_table_name(current_table_name, target_db)
+        safe_new = _sanitize_identifier(new_table_name)
+        current_tables = {name.lower() for name in self.get_table_names(target_db)}
+
+        if safe_new == real_current.lower():
+            return ExecutionResult(
+                success=True,
+                message=f"Table `{real_current}` already has that name.",
+            )
+
+        if safe_new in current_tables:
+            return ExecutionResult(
+                success=False,
+                error=f"Table `{safe_new}` already exists.",
+            )
+
+        sql = f"RENAME TABLE `{real_current}` TO `{safe_new}`;"
+        statements = [f"USE `{target_db}`;", sql]
+        try:
+            with self._server_engine.begin() as conn:
+                conn.exec_driver_sql(f"USE `{target_db}`;")
+                conn.exec_driver_sql(sql)
+            return ExecutionResult(
+                success=True,
+                sql_executed="\n".join(statements),
+                message=f"Renamed table `{real_current}` to `{safe_new}`.",
+            )
+        except SQLAlchemyError as exc:
+            log.error("Rename table failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
+    def drop_table(
+        self,
+        table_name: str,
+        *,
+        database: str | None = None,
+    ) -> ExecutionResult:
+        target_db = self._require_database(database)
+        real_table = self._match_table_name(table_name, target_db)
+        sql = f"DROP TABLE `{real_table}`;"
+        statements = [f"USE `{target_db}`;", sql]
+        try:
+            with self._server_engine.begin() as conn:
+                conn.exec_driver_sql(f"USE `{target_db}`;")
+                conn.exec_driver_sql(sql)
+            return ExecutionResult(
+                success=True,
+                sql_executed="\n".join(statements),
+                message=f"Deleted table `{real_table}`.",
+            )
+        except SQLAlchemyError as exc:
+            log.error("Drop table failed: %s", exc)
             return ExecutionResult(success=False, error=str(exc))
 
     def execute_plan(self, plan: ActionPlan) -> ExecutionResult:
