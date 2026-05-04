@@ -10,6 +10,9 @@ This service connects at the server level so commands such as:
 - CREATE / INSERT / SELECT / UPDATE / DELETE / ALTER / TRUNCATE / DROP
 
 behave much closer to a real MySQL console.
+
+Adds:
+- update_rows_by_id() for safe partial saves of edited query results.
 """
 from __future__ import annotations
 
@@ -291,6 +294,97 @@ class MySQLSessionService:
             log.error("Save table data failed: %s", exc)
             return ExecutionResult(success=False, error=str(exc))
 
+    def update_rows_by_id(
+        self,
+        table_name: str,
+        df: pd.DataFrame,
+        *,
+        database: str | None = None,
+    ) -> ExecutionResult:
+        """
+        Update only the rows present in `df`, matched by primary key (default 'id').
+        Safer than replace_table_data() when the user edited a filtered subset.
+        """
+        target_db = self._require_database(database)
+        real_table = self._match_table_name(table_name, target_db)
+        db_columns = self.get_table_columns(real_table, target_db)
+
+        if not db_columns:
+            return ExecutionResult(success=False, error=f"Table '{real_table}' has no columns.")
+
+        # Find primary key column (fall back to 'id')
+        pk_col = next(
+            (c["name"] for c in db_columns if c.get("primary_key")),
+            None,
+        )
+        if not pk_col:
+            pk_col = next(
+                (c["name"] for c in db_columns if c["name"].lower() == "id"),
+                None,
+            )
+
+        if not pk_col:
+            return ExecutionResult(
+                success=False,
+                error=(
+                    f"Table `{real_table}` has no primary key / id column, so we can't "
+                    "match edited rows safely. Use 'Save to MySQL (replace all)' instead."
+                ),
+            )
+
+        if pk_col not in df.columns:
+            return ExecutionResult(
+                success=False,
+                error=(
+                    f"The result table is missing the `{pk_col}` column, so edits can't "
+                    f"be matched back. Run `SELECT * FROM {real_table}` first."
+                ),
+            )
+
+        clean_df = df.dropna(how="all").copy()
+        clean_df = clean_df.where(pd.notnull(clean_df), None)
+
+        if clean_df.empty:
+            return ExecutionResult(success=True, message="Nothing to update.", rows_affected=0)
+
+        db_column_names = {c["name"] for c in db_columns}
+        writable_columns = [
+            c for c in clean_df.columns
+            if c != pk_col and c in db_column_names
+        ]
+        if not writable_columns:
+            return ExecutionResult(
+                success=False,
+                error="No editable columns found in the result that match the table schema.",
+            )
+
+        set_clause = ", ".join(f"`{c}` = :{c}" for c in writable_columns)
+        update_sql = (
+            f"UPDATE `{real_table}` SET {set_clause} WHERE `{pk_col}` = :{pk_col};"
+        )
+
+        statements = [f"USE `{target_db}`;", update_sql]
+        try:
+            affected = 0
+            with self._database_engine(target_db).begin() as conn:
+                for record in clean_df.to_dict(orient="records"):
+                    if record.get(pk_col) is None:
+                        continue
+                    params = {c: record.get(c) for c in writable_columns}
+                    params[pk_col] = record[pk_col]
+                    result = conn.execute(text(update_sql), params)
+                    affected += result.rowcount or 0
+
+            return ExecutionResult(
+                success=True,
+                sql_executed="\n".join(statements),
+                rows_affected=affected,
+                message=f"Updated {affected} row(s) in `{real_table}`.",
+            )
+        except SQLAlchemyError as exc:
+            log.error("Update rows failed: %s", exc)
+            return ExecutionResult(success=False, error=str(exc))
+
     def _infer_series_sql_type(self, column_name: str, series: pd.Series) -> str:
         non_null = series.dropna()
         if non_null.empty:
@@ -411,8 +505,6 @@ class MySQLSessionService:
             target_db = self._require_database()
             generator = MySQLQueryGenerator(self._database_engine(target_db))
             sql, params = generator.generate(plan)
-            if sql.strip().upper().startswith("SELECT") or sql.strip().upper().startswith("DESCRIBE"):
-                return self._run_database_sql(sql, params=params, database=target_db)
             return self._run_database_sql(sql, params=params, database=target_db)
         except (ValueError, SQLAlchemyError) as exc:
             log.error("DB error: %s", exc)

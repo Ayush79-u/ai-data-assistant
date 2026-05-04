@@ -1,16 +1,22 @@
 """
 streamlit_app.py — Simple, friendly UI for the AI Data Assistant.
 
-Changes vs previous version:
-- Removed the "Table options" sidebar block (per request).
-- Added "Generate SQL with AI" (Qwen) inside the existing SQL Editor.
-- Added DROP/TRUNCATE safety guard before Run SQL.
-- All other features preserved: chat, table editor, Excel import/export,
-  query history, blueprint builder, destructive confirmation, etc.
+Features:
+- Removed "Table options" sidebar block.
+- AI SQL generation via OpenRouter inside the SQL Editor.
+- DROP/TRUNCATE safety guard before any SQL run.
+- "✏️ Edit these results" button on chat result tables — loads them into
+  the Table Editor for inline editing.
+- Two save modes in the Table Editor:
+    • "💾 Save edits only"  — updates rows by id (safe for filtered results)
+    • "Save to MySQL (replace all)" — old replace-all behavior
+- All other features preserved: chat, Excel import/export, blueprint builder,
+  query history, destructive confirmation, etc.
 """
 from __future__ import annotations
 
 import io
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -127,7 +133,7 @@ def _render_sidebar() -> None:
     tables = _eng().mysql.get_table_names()
 
     # NOTE: "Table options" section removed per request.
-    # Table selection still available via the toolbar selectbox in the main area.
+    # Table selection is available via the toolbar selectbox in the main area.
 
     with st.expander("Build a table", expanded=not tables):
         with st.form("create_table_form", clear_on_submit=True):
@@ -287,6 +293,8 @@ def _render_sidebar() -> None:
                             st.rerun()
 
 
+# ── Chat area ─────────────────────────────────────────────────────────────────
+
 def _render_chat_area() -> None:
     import plotly.graph_objects as go
 
@@ -314,15 +322,31 @@ def _render_chat_area() -> None:
             if result and result.data is not None:
                 if isinstance(result.data, pd.DataFrame) and not result.data.empty:
                     st.dataframe(result.data, use_container_width=True, hide_index=True)
+
+                    # Buttons row: Download + Edit
+                    btn_col1, btn_col2 = st.columns(2)
+
                     buf = io.BytesIO()
                     result.data.to_excel(buf, index=False)
-                    st.download_button(
+                    btn_col1.download_button(
                         "⬇️ Download as Excel",
                         data=buf.getvalue(),
                         file_name="result.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         key=f"dl_{turn['ts']}_{id(result)}",
+                        use_container_width=True,
                     )
+
+                    # Only show Edit button if the SQL targets a known table
+                    target_tbl = _infer_table_from_sql(result.sql_executed or "")
+                    if target_tbl:
+                        if btn_col2.button(
+                            "✏️ Edit these results",
+                            key=f"edit_results_{turn['ts']}_{id(result)}",
+                            use_container_width=True,
+                        ):
+                            _edit_query_results(target_tbl, result.data)
+                            st.rerun()
                 elif isinstance(result.data, go.Figure):
                     st.plotly_chart(result.data, use_container_width=True)
             if result and result.error:
@@ -450,7 +474,7 @@ def _render_editors() -> None:
                 st.session_state.new_column_name = ""
                 st.session_state.new_column_source = current
 
-            c_reload, c_add_row, c_save = st.columns(3)
+            c_reload, c_add_row, c_save_edits, c_save_all = st.columns(4)
             if c_reload.button(
                 "Reload from DB",
                 use_container_width=True,
@@ -492,11 +516,25 @@ def _render_editors() -> None:
             )
             st.session_state.table_editor_df = edited
 
-            if c_save.button(
-                "Save to MySQL",
+            if c_save_edits.button(
+                "💾 Save edits only",
+                use_container_width=True,
+                key=f"save_edits_{current}",
+                help="Updates only the rows shown here (matched by id). "
+                     "Safe for filtered query results.",
+            ):
+                save_result = _save_edits_only()
+                if save_result.success:
+                    st.success(save_result.message)
+                    st.rerun()
+                st.error(save_result.error or "Save failed.")
+
+            if c_save_all.button(
+                "Save to MySQL (replace all)",
                 type="primary",
                 use_container_width=True,
                 key=f"save_editor_{current}",
+                help="⚠️ Replaces ALL rows in the table with what's in the editor.",
             ):
                 save_result = _save_current_table()
                 if save_result.success:
@@ -507,7 +545,7 @@ def _render_editors() -> None:
     if st.session_state.sql_editor_text or st.session_state.current_table:
         with st.expander("SQL Editor - tweak and re-run", expanded=False):
 
-            # ── AI SQL generation (Qwen) ──────────────────────────────
+            # ── AI SQL generation (OpenRouter) ────────────────────────
             st.markdown("**🤖 Generate SQL with AI**")
             ai_col_input, ai_col_btn = st.columns([4, 1.4])
             ai_col_input.text_input(
@@ -541,7 +579,6 @@ def _render_editors() -> None:
                 use_container_width=True,
                 key="run_sql_editor_button",
             ):
-                # Safety check before execution
                 if not is_safe_sql(sql):
                     st.error("Blocked: queries containing DROP or TRUNCATE are not allowed.")
                 else:
@@ -554,6 +591,8 @@ def _render_editors() -> None:
                 st.session_state.sql_editor_text = ""
                 st.rerun()
 
+
+# ── Chat input + processing ───────────────────────────────────────────────────
 
 def _render_chat_input() -> None:
     prefill = st.session_state.pop("prefill", "") or ""
@@ -658,17 +697,14 @@ def _friendly_reply(result: ExecutionResult) -> str:
 # ── AI SQL helper ─────────────────────────────────────────────────────────────
 
 def _generate_sql_with_ai(nl_input: str) -> None:
-    """Call Qwen and inject the generated SQL into the existing editor."""
+    """Call OpenRouter and inject the generated SQL into the existing editor."""
     if not nl_input.strip():
         st.warning("Type what you want in plain English first.")
         return
 
     current = st.session_state.current_table
-
-    # Detect data source: Excel if a workbook is uploaded this session, else MySQL.
     data_source = "excel" if st.session_state.get("excel_upload") is not None else "mysql"
 
-    # Build a compact schema string for the active table (or whole DB).
     schema_str = ""
     try:
         if current:
@@ -680,7 +716,7 @@ def _generate_sql_with_ai(nl_input: str) -> None:
         schema_str = f"(could not load schema: {exc})"
 
     try:
-        with st.spinner("Asking Qwen…"):
+        with st.spinner("Asking AI…"):
             sql = generate_sql(
                 user_input=nl_input,
                 schema=schema_str,
@@ -698,6 +734,37 @@ def _generate_sql_with_ai(nl_input: str) -> None:
         f"click **Run SQL** when ready.\n\n```sql\n{sql}\n```",
     )
     st.success("SQL inserted into the editor.")
+
+
+# ── Inline-edit-results helpers ───────────────────────────────────────────────
+
+def _infer_table_from_sql(sql: str) -> str:
+    """Extract the first table name from a SELECT statement, if it exists in MySQL."""
+    if not sql:
+        return ""
+    match = re.search(r"\bFROM\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?", sql, re.IGNORECASE)
+    if not match:
+        return ""
+    table = match.group(1).lower()
+    try:
+        existing = {t.lower() for t in _eng().mysql.get_table_names()}
+        return table if table in existing else ""
+    except Exception:
+        return ""
+
+
+def _edit_query_results(table_name: str, df: pd.DataFrame) -> None:
+    """Load query results into the Table Editor for inline editing."""
+    _set_table_editor(table_name, df)
+    _append(
+        "assistant",
+        f"Loaded these rows into the **Table Editor** below for `{table_name}`. "
+        "Edit any cell, then choose how to save:\n\n"
+        "• **💾 Save edits only** — updates just the rows you see here (matched by id). "
+        "Use this when you filtered (e.g. only HR department).\n"
+        "• **Save to MySQL (replace all)** — replaces ALL rows in the table with the editor contents. "
+        "Use this only when the editor holds the full table.",
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -775,6 +842,7 @@ def _select_current_table() -> None:
 
 
 def _save_current_table() -> ExecutionResult:
+    """Replace all rows of the current table with the editor contents."""
     current = st.session_state.current_table
     if not current:
         return ExecutionResult(success=False, error="No table is currently open.")
@@ -788,7 +856,30 @@ def _save_current_table() -> ExecutionResult:
         _set_sql_editor(save_result.sql_executed)
         _append(
             "assistant",
-            f"Saved your edits back to `{current}`.",
+            f"Saved your edits back to `{current}` (replace mode).",
+            save_result,
+        )
+        _load_table_editor(current)
+    return save_result
+
+
+def _save_edits_only() -> ExecutionResult:
+    """Update only the rows currently in the editor (matched by id)."""
+    current = st.session_state.current_table
+    if not current:
+        return ExecutionResult(success=False, error="No table is currently open.")
+
+    save_result = _eng().mysql.update_rows_by_id(
+        current,
+        st.session_state.table_editor_df,
+    )
+    _log_query(save_result)
+    if save_result.success:
+        _set_sql_editor(save_result.sql_executed)
+        _append(
+            "assistant",
+            f"Updated edited rows in `{current}` "
+            f"({save_result.rows_affected} row(s) affected).",
             save_result,
         )
         _load_table_editor(current)
