@@ -315,44 +315,115 @@ def _render_chat_area() -> None:
         )
         return
 
-    for turn in st.session_state.chat:
+    for idx, turn in enumerate(st.session_state.chat):
         with st.chat_message(turn["role"]):
             st.markdown(turn["content"])
             result: ExecutionResult | None = turn.get("result")
-            if result and result.data is not None:
-                if isinstance(result.data, pd.DataFrame) and not result.data.empty:
-                    st.dataframe(result.data, use_container_width=True, hide_index=True)
 
-                    # Buttons row: Download + Edit
+            if result and result.data is not None:
+
+                if isinstance(result.data, pd.DataFrame) and not result.data.empty:
+
+                    # ✅ FIX: use stable unique keys
+                    edit_key = f"edit_mode_{idx}"
+                    editor_key = f"editor_{idx}"
+
+                    # =========================
+                    # ✏️ EDIT MODE
+                    # =========================
+                    if st.session_state.get(edit_key, False):
+
+                        edited_df = st.data_editor(
+                            result.data,
+                            key=editor_key,
+                            use_container_width=True,
+                            num_rows="dynamic"
+                        )
+
+                        st.warning("⚠️ This will overwrite the entire table")
+
+                        col1, col2, col3 = st.columns(3)
+
+                        # 💾 Save edits only (DB update)
+                        if col1.button("💾 Save edits only", key=f"save_{idx}"):
+
+                            target_tbl = _infer_table_from_sql(result.sql_executed or "")
+
+                            if target_tbl:
+                                save_result = _eng().mysql.update_rows_by_id(
+                                    target_tbl,
+                                    edited_df,
+                                    id_column="EmpID"  # IMPORTANT for your table
+                                )
+
+                                if save_result.success:
+                                    st.success(f"✅ Updated {save_result.rows_affected} rows")
+                                    st.rerun()
+                                else:
+                                    st.error(save_result.error or "Save failed")
+
+                        # 🚀 Replace all
+                        if col2.button("🚀 Save to MySQL (replace all)", key=f"replace_{idx}"):
+
+                            target_tbl = _infer_table_from_sql(result.sql_executed or "")
+
+                            if target_tbl:
+                                save_result = _eng().mysql.replace_table_data(target_tbl, edited_df)
+
+                                if save_result.success:
+                                    st.success("✅ Table fully replaced in MySQL")
+                                    st.rerun()
+                                else:
+                                    st.error(save_result.error or "Replace failed")
+
+                        # ❌ Cancel
+                        if col3.button("❌ Cancel", key=f"cancel_{idx}"):
+                            st.session_state[edit_key] = False
+                            st.rerun()
+
+                    # =========================
+                    # 📊 NORMAL VIEW
+                    # =========================
+                    else:
+                        st.dataframe(result.data, use_container_width=True, hide_index=True)
+
+                    # =========================
+                    # DOWNLOAD + EDIT BUTTONS
+                    # =========================
                     btn_col1, btn_col2 = st.columns(2)
 
                     buf = io.BytesIO()
                     result.data.to_excel(buf, index=False)
+
                     btn_col1.download_button(
                         "⬇️ Download as Excel",
                         data=buf.getvalue(),
                         file_name="result.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_{turn['ts']}_{id(result)}",
+                        key=f"dl_{idx}",
                         use_container_width=True,
                     )
 
-                    # Only show Edit button if the SQL targets a known table
                     target_tbl = _infer_table_from_sql(result.sql_executed or "")
+
                     if target_tbl:
                         if btn_col2.button(
                             "✏️ Edit these results",
-                            key=f"edit_results_{turn['ts']}_{id(result)}",
+                            key=f"edit_btn_{idx}",
                             use_container_width=True,
                         ):
-                            _edit_query_results(target_tbl, result.data)
+                            st.session_state[edit_key] = True
                             st.rerun()
+
                 elif isinstance(result.data, go.Figure):
                     st.plotly_chart(result.data, use_container_width=True)
+
             if result and result.error:
                 st.error(result.error)
 
-    # Destructive confirmation
+    # =========================
+    # DESTRUCTIVE CONFIRMATION
+    # =========================
     if st.session_state.pending_plan is not None:
         plan = st.session_state.pending_plan
         st.warning(
@@ -360,17 +431,19 @@ def _render_chat_area() -> None:
             "Are you sure? This can't be undone.",
             icon="⚠️",
         )
+
         yes_col, no_col = st.columns(2)
+
         if yes_col.button("✅ Yes, go ahead", type="primary", use_container_width=True):
             result = _eng().execute(plan)
             _handle_result(plan, result)
             st.session_state.pending_plan = None
             st.rerun()
+
         if no_col.button("❌ Cancel", use_container_width=True):
             _append("assistant", "OK, cancelled. Nothing was changed.")
             st.session_state.pending_plan = None
             st.rerun()
-
 
 # ── Editors ───────────────────────────────────────────────────────────────────
 
@@ -796,9 +869,6 @@ def _set_table_editor(table_name: str, df: pd.DataFrame) -> None:
     st.session_state.table_editor_table = table_name
     st.session_state.table_editor_df = df.copy()
     st.session_state.table_editor_version += 1
-    st.session_state.top_table_selector = table_name
-    st.session_state.rename_table_name = table_name
-    st.session_state.rename_table_source = table_name
 
 
 def _open_table(table_name: str, *, announce: bool = False) -> None:
