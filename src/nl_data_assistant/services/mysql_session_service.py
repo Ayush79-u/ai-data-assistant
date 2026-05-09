@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from contextlib import contextmanager
 from typing import Any, Generator
 
@@ -78,6 +79,13 @@ def _normalise_sql_type(value: str) -> str:
 
 
 class MySQLSessionService:
+    _SCHEMA_CACHE_TTL_SECONDS = 120
+    _AI_MAX_TABLES = 6
+    _AI_SAMPLE_ROWS = 5
+    _AI_DISTINCT_VALUE_LIMIT = 6
+    _AI_LOW_CARDINALITY_THRESHOLD = 12
+    _AI_MAX_VALUE_CHARS = 48
+
     def __init__(
         self,
         server_engine: Engine | None = None,
@@ -90,6 +98,7 @@ class MySQLSessionService:
             pool_recycle=3600,
         )
         self._database_engines: dict[str, Engine] = {}
+        self._schema_context_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._current_database = default_database.strip() or settings.default_database
         if self._current_database and self._current_database not in self.get_database_names():
             self._current_database = ""
@@ -301,89 +310,274 @@ class MySQLSessionService:
         *,
         database: str | None = None,
     ) -> ExecutionResult:
-        """
-        Update only the rows present in `df`, matched by primary key (default 'id').
-        Safer than replace_table_data() when the user edited a filtered subset.
-        """
+        """Update or insert the rows present in ``df`` using a safe matching column."""
         target_db = self._require_database(database)
         real_table = self._match_table_name(table_name, target_db)
         db_columns = self.get_table_columns(real_table, target_db)
 
         if not db_columns:
             return ExecutionResult(success=False, error=f"Table '{real_table}' has no columns.")
-
-        # Find primary key column (fall back to 'id')
-        pk_col = next(
-            (c["name"] for c in db_columns if c.get("primary_key")),
-            None,
-        )
-        if not pk_col:
-            pk_col = next(
-                (c["name"] for c in db_columns if c["name"].lower() == "id"),
-                None,
-            )
-
-        if not pk_col:
-            return ExecutionResult(
-                success=False,
-                error=(
-                    f"Table `{real_table}` has no primary key / id column, so we can't "
-                    "match edited rows safely. Use 'Save to MySQL (replace all)' instead."
-                ),
-            )
-
-        if pk_col not in df.columns:
-            return ExecutionResult(
-                success=False,
-                error=(
-                    f"The result table is missing the `{pk_col}` column, so edits can't "
-                    f"be matched back. Run `SELECT * FROM {real_table}` first."
-                ),
-            )
-
-        clean_df = df.dropna(how="all").copy()
-        clean_df = clean_df.where(pd.notnull(clean_df), None)
-
+        clean_df = self._prepare_editor_dataframe(df, db_columns)
         if clean_df.empty:
             return ExecutionResult(success=True, message="Nothing to update.", rows_affected=0)
 
-        db_column_names = {c["name"] for c in db_columns}
-        writable_columns = [
-            c for c in clean_df.columns
-            if c != pk_col and c in db_column_names
-        ]
-        if not writable_columns:
-            return ExecutionResult(
-                success=False,
-                error="No editable columns found in the result that match the table schema.",
-            )
-
-        set_clause = ", ".join(f"`{c}` = :{c}" for c in writable_columns)
-        update_sql = (
-            f"UPDATE `{real_table}` SET {set_clause} WHERE `{pk_col}` = :{pk_col};"
-        )
-
-        statements = [f"USE `{target_db}`;", update_sql]
+        statements = [f"USE `{target_db}`;"]
         try:
-            affected = 0
+            updated = 0
+            inserted = 0
+            skipped = 0
+
             with self._database_engine(target_db).begin() as conn:
+                db_columns = self._ensure_dataframe_columns(conn, real_table, clean_df, db_columns)
+                db_column_names = {column["name"] for column in db_columns}
+                match_column = self._choose_match_column(conn, real_table, db_columns, clean_df)
+
+                if not match_column:
+                    return ExecutionResult(
+                        success=False,
+                        error=(
+                            f"Table `{real_table}` has no safe matching column yet. "
+                            "Add a unique id-like column such as `id`, `empid`, or "
+                            f"`{real_table}_id`, or use 'Save to MySQL (replace all)'."
+                        ),
+                    )
+
+                key_meta = next(
+                    (column for column in db_columns if column["name"] == match_column),
+                    {"name": match_column},
+                )
+                key_is_auto = self._is_auto_increment_column(key_meta)
+
+                existing_key_rows = conn.execute(
+                    text(
+                        f"SELECT `{match_column}` FROM `{real_table}` "
+                        f"WHERE `{match_column}` IS NOT NULL;"
+                    )
+                ).fetchall()
+                existing_keys = {row[0] for row in existing_key_rows}
+
+                writable_columns = [
+                    column_name
+                    for column_name in clean_df.columns
+                    if column_name != match_column and column_name in db_column_names
+                ]
+                insert_columns = [
+                    column_name
+                    for column_name in clean_df.columns
+                    if column_name in db_column_names
+                    and (column_name != match_column or not key_is_auto)
+                ]
+
+                update_sql = ""
+                if writable_columns:
+                    set_clause = ", ".join(
+                        f"`{column_name}` = :{column_name}"
+                        for column_name in writable_columns
+                    )
+                    update_sql = (
+                        f"UPDATE `{real_table}` SET {set_clause} "
+                        f"WHERE `{match_column}` = :{match_column};"
+                    )
+                    statements.append(update_sql)
+
+                insert_sql = ""
+                if insert_columns:
+                    column_sql = ", ".join(f"`{column_name}`" for column_name in insert_columns)
+                    value_sql = ", ".join(f":{column_name}" for column_name in insert_columns)
+                    insert_sql = (
+                        f"INSERT INTO `{real_table}` ({column_sql}) VALUES ({value_sql});"
+                    )
+                    statements.append(insert_sql)
+
                 for record in clean_df.to_dict(orient="records"):
-                    if record.get(pk_col) is None:
+                    row_values = {
+                        column_name: record.get(column_name)
+                        for column_name in clean_df.columns
+                        if column_name in db_column_names
+                    }
+                    if not any(not self._is_blank_value(value) for value in row_values.values()):
                         continue
-                    params = {c: record.get(c) for c in writable_columns}
-                    params[pk_col] = record[pk_col]
-                    result = conn.execute(text(update_sql), params)
-                    affected += result.rowcount or 0
+
+                    key_value = record.get(match_column)
+
+                    if not self._is_blank_value(key_value) and key_value in existing_keys:
+                        if not update_sql:
+                            skipped += 1
+                            continue
+                        params = {column_name: record.get(column_name) for column_name in writable_columns}
+                        params[match_column] = key_value
+                        result = conn.execute(text(update_sql), params)
+                        updated += result.rowcount or 0
+                        continue
+
+                    if not insert_sql:
+                        skipped += 1
+                        continue
+
+                    if self._is_blank_value(key_value) and not key_is_auto:
+                        skipped += 1
+                        continue
+
+                    insert_payload = {
+                        column_name: record.get(column_name)
+                        for column_name in insert_columns
+                    }
+                    if key_is_auto and match_column in insert_payload:
+                        insert_payload.pop(match_column, None)
+
+                    if not any(
+                        not self._is_blank_value(value)
+                        for column_name, value in insert_payload.items()
+                        if column_name != match_column
+                    ):
+                        continue
+
+                    result = conn.execute(text(insert_sql), insert_payload)
+                    inserted += result.rowcount or 1
+                    if not self._is_blank_value(key_value):
+                        existing_keys.add(key_value)
+
+            total_changed = updated + inserted
+            summary = (
+                f"Saved editor changes to `{real_table}` using `{match_column}`. "
+                f"Updated {updated} row(s), inserted {inserted} row(s)."
+            )
+            if skipped:
+                summary += f" Skipped {skipped} row(s) that could not be matched safely."
 
             return ExecutionResult(
                 success=True,
                 sql_executed="\n".join(statements),
-                rows_affected=affected,
-                message=f"Updated {affected} row(s) in `{real_table}`.",
+                rows_affected=total_changed,
+                message=summary,
             )
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, ValueError) as exc:
             log.error("Update rows failed: %s", exc)
             return ExecutionResult(success=False, error=str(exc))
+
+    def _prepare_editor_dataframe(
+        self,
+        df: pd.DataFrame,
+        db_columns: list[dict[str, Any]],
+    ) -> pd.DataFrame:
+        clean_df = df.dropna(how="all").copy()
+        clean_df.columns = [str(column).strip() for column in clean_df.columns]
+        db_name_map = {
+            _sanitize_identifier(str(column["name"])): str(column["name"])
+            for column in db_columns
+        }
+
+        rename_map: dict[str, str] = {}
+        for column_name in clean_df.columns:
+            safe_name = _sanitize_identifier(column_name)
+            rename_map[column_name] = db_name_map.get(safe_name, safe_name)
+
+        if rename_map:
+            clean_df = clean_df.rename(columns=rename_map)
+
+        duplicated_columns = clean_df.columns[clean_df.columns.duplicated()].tolist()
+        if duplicated_columns:
+            duplicates = ", ".join(sorted(set(map(str, duplicated_columns))))
+            raise ValueError(f"Duplicate column names found after cleaning: {duplicates}.")
+
+        return clean_df.where(pd.notnull(clean_df), None)
+
+    def _ensure_dataframe_columns(
+        self,
+        conn,
+        table_name: str,
+        clean_df: pd.DataFrame,
+        db_columns: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        db_column_names = {column["name"] for column in db_columns}
+        extra_columns = [name for name in clean_df.columns if name not in db_column_names]
+
+        for column_name in extra_columns:
+            sql_type = self._infer_series_sql_type(column_name, clean_df[column_name])
+            alter_sql = f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {sql_type};"
+            conn.exec_driver_sql(alter_sql)
+            db_columns.append({"name": column_name, "type": sql_type})
+
+        return db_columns
+
+    def _choose_match_column(
+        self,
+        conn,
+        table_name: str,
+        db_columns: list[dict[str, Any]],
+        clean_df: pd.DataFrame,
+    ) -> str:
+        shared_columns = {
+            column["name"]
+            for column in db_columns
+            if column["name"] in clean_df.columns
+        }
+        if not shared_columns:
+            return ""
+
+        primary_key = next(
+            (
+                column["name"]
+                for column in db_columns
+                if column.get("primary_key") and column["name"] in shared_columns
+            ),
+            "",
+        )
+        if primary_key:
+            return primary_key
+
+        safe_table = _sanitize_identifier(table_name)
+        ranked_candidates: list[tuple[int, str]] = []
+        for column in db_columns:
+            name = column["name"]
+            if name not in shared_columns:
+                continue
+            lowered = name.lower()
+            if lowered == "id":
+                ranked_candidates.append((0, name))
+            elif lowered in {f"{safe_table}id", f"{safe_table}_id"}:
+                ranked_candidates.append((1, name))
+            elif lowered.endswith("_id"):
+                ranked_candidates.append((2, name))
+            elif lowered.endswith("id"):
+                ranked_candidates.append((3, name))
+            elif clean_df[name].dropna().is_unique:
+                ranked_candidates.append((4, name))
+
+        for _score, candidate in sorted(ranked_candidates, key=lambda item: (item[0], item[1])):
+            if self._column_has_unique_db_values(conn, table_name, candidate):
+                return candidate
+
+        return ""
+
+    @staticmethod
+    def _is_auto_increment_column(column: dict[str, Any]) -> bool:
+        autoincrement_value = str(column.get("autoincrement", "")).lower()
+        return bool(
+            autoincrement_value in {"true", "auto", "auto_increment"}
+            or "auto_increment" in autoincrement_value
+        )
+
+    @staticmethod
+    def _is_blank_value(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        return False
+
+    def _column_has_unique_db_values(self, conn, table_name: str, column_name: str) -> bool:
+        result = conn.execute(
+            text(
+                f"SELECT COUNT(`{column_name}`), COUNT(DISTINCT `{column_name}`) "
+                f"FROM `{table_name}` WHERE `{column_name}` IS NOT NULL;"
+            )
+        ).first()
+        if result is None:
+            return False
+        total_values = int(result[0] or 0)
+        distinct_values = int(result[1] or 0)
+        return total_values > 0 and total_values == distinct_values
 
     def _infer_series_sql_type(self, column_name: str, series: pd.Series) -> str:
         non_null = series.dropna()
@@ -510,6 +704,17 @@ class MySQLSessionService:
             log.error("DB error: %s", exc)
             return ExecutionResult(success=False, error=str(exc))
 
+    def preview_plan_sql(
+        self,
+        plan: ActionPlan,
+        *,
+        database: str | None = None,
+    ) -> str:
+        target_db = self._require_database(database)
+        generator = MySQLQueryGenerator(self._database_engine(target_db))
+        sql, _params = generator.generate(plan)
+        return sql
+
     def execute_sql(self, sql: str) -> ExecutionResult:
         raw_statements = sqlparse.split(sql) if sqlparse else sql.split(";")
         statements = [statement.strip() for statement in raw_statements if statement.strip()]
@@ -619,6 +824,36 @@ class MySQLSessionService:
         with self._server_engine.begin() as conn:
             return self._execute_with_connection(conn, sql, params=params, database="")
 
+    @staticmethod
+    def _escape_literal_percents_for_driver_sql(sql: str) -> str:
+        """
+        Escape literal percent signs for raw DBAPI execution.
+
+        PyMySQL treats `%` in raw SQL strings as Python formatting markers when
+        `exec_driver_sql()` ultimately routes to the DBAPI cursor without bound
+        parameters. We only escape lone percent signs here; already-escaped `%%`
+        sequences are preserved as-is.
+        """
+        if "%" not in sql:
+            return sql
+
+        escaped: list[str] = []
+        index = 0
+        while index < len(sql):
+            char = sql[index]
+            if char != "%":
+                escaped.append(char)
+                index += 1
+                continue
+
+            escaped.append("%%")
+            if index + 1 < len(sql) and sql[index + 1] == "%":
+                index += 2
+            else:
+                index += 1
+
+        return "".join(escaped)
+
     def _execute_with_connection(
         self,
         conn,
@@ -631,7 +866,8 @@ class MySQLSessionService:
             if params:
                 result = conn.execute(text(sql), params)
             else:
-                result = conn.exec_driver_sql(sql)
+                driver_sql = self._escape_literal_percents_for_driver_sql(sql)
+                result = conn.exec_driver_sql(driver_sql)
 
             if result.returns_rows or sql.strip().upper().startswith(_ROW_RETURNING_PREFIXES):
                 rows = result.fetchall()

@@ -52,6 +52,23 @@ class LocalParser:
         for pattern, intent in self._INTENT_MAP:
             if pattern.search(cmd):
                 return intent
+        if re.search(
+            r"\b(?:names?|[a-zA-Z_][a-zA-Z0-9_]*)\s+"
+            r"(?:starting|starts|ending|ends|contains|containing)\b",
+            cmd,
+            re.I,
+        ):
+            return Intent.SELECT
+        if re.search(r"\bnames?\s+with\b", cmd, re.I):
+            return Intent.SELECT
+        if re.search(
+            r"\b(?:people|employees|workers?)\s+"
+            r"(?:working\s+in|working\s+before|working\s+after|working\s+on|"
+            r"joined\s+before|joined\s+after|hired\s+before|hired\s+after)\b",
+            cmd,
+            re.I,
+        ):
+            return Intent.SELECT
         return Intent.UNKNOWN
 
     def _extract_table(self, cmd: str, intent: Intent) -> str:
@@ -150,7 +167,8 @@ class LocalParser:
                 re.I,
             )
             if text_filter:
-                return [self._normalize_identifier(text_filter.group(1))]
+                column = self._normalize_column_reference(text_filter.group(1))
+                return [column] if column else []
 
             names_with = re.search(
                 r"\bnames?\s+with\s+(.+?)(?:\s+(?:order|limit)\b|$)",
@@ -182,7 +200,7 @@ class LocalParser:
         for pattern, builder in text_patterns:
             match = re.search(pattern, cmd, re.I)
             if match:
-                column = self._normalize_identifier(match.group(1))
+                column = self._normalize_column_reference(match.group(1))
                 value = self._clean_value(match.group(2))
                 if column and value:
                     return builder(column, value)
@@ -265,6 +283,13 @@ class LocalParser:
     @staticmethod
     def _normalize_identifier(value: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower()).strip("_")
+
+    def _normalize_column_reference(self, value: str) -> str:
+        normalized = self._normalize_identifier(value)
+        aliases = {
+            "names": "name",
+        }
+        return aliases.get(normalized, normalized)
 
     @staticmethod
     def _clean_value(value: str) -> str:

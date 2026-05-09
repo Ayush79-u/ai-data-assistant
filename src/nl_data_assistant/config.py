@@ -9,10 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-# Load .env
-load_dotenv()
+ROOT = Path(__file__).resolve().parents[2]
+ENV_PATH = find_dotenv() or str(ROOT / ".env")
+
+# Load .env as early and as explicitly as possible.
+load_dotenv(ENV_PATH, override=True)
+print("GROQ:", os.getenv("GROQ_API_KEY"))
 
 _REQUIRED_MYSQL = ["MYSQL_HOST", "MYSQL_USER"]
 

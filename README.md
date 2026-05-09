@@ -26,7 +26,7 @@ The app translates commands into structured actions, cleans data, maps schemas, 
 - Streamlit workbench UI for interactive use
 - FastAPI backend for parse and execute endpoints
 - CLI mode for quick testing
-- Optional OpenAI-powered parsing when you provide `OPENAI_API_KEY` and `OPENAI_MODEL`
+- Optional Groq SQL generation with `llama-3.3-70b-versatile` when you provide `GROQ_API_KEY`
 
 ## Project Structure
 
@@ -75,7 +75,7 @@ pip install -e .
 ```
 
 4. Copy `.env.example` to `.env` and fill in your MySQL connection details.
-5. Optional: add `OPENAI_API_KEY` and `OPENAI_MODEL` if you want LLM-based parsing.
+5. Optional: add `GROQ_API_KEY` to enable Groq SQL generation fallback with `llama-3.3-70b-versatile`.
 6. Start the UI:
 
 ```bash
@@ -117,7 +117,7 @@ python cli.py --command "Create a table of students with name and CGPA"
 - `local_parser.py` handles intent detection, entity extraction, random row generation, and SQL generation without any external AI API
 - `mysql_query_generator.py` refines parsed entities with real MySQL schema information so table and column names resolve more accurately
 - `table_blueprint.py` converts create-table commands into JSON containing table name, MySQL-compatible columns, and sample data
-- `CommandInterpreter` converts natural language into an `ActionPlan` and can still fall back to OpenAI if you enable it
+- `CommandInterpreter` converts natural language into an `ActionPlan`
 - `DataAssistantEngine` dispatches the plan to the correct service
 - `ExcelService` handles workbook and sheet operations
 - `MySQLService` handles SQL operations through SQLAlchemy
@@ -129,7 +129,7 @@ python cli.py --command "Create a table of students with name and CGPA"
 ## Important Notes
 
 - The default parser is rule-based and safe for the included commands.
-- If you enable OpenAI parsing, the app falls back to the rule-based parser when the API response is unavailable or invalid.
+- If you enable Groq SQL generation, the app still tries the local parser first and only uses Groq when the local SQL generator cannot finish the request.
 - The project does not auto-create a MySQL server. You still need a running MySQL instance and valid credentials.
 - If MySQL is configured, the parser now tries to inspect table schemas and use them to generate cleaner SQL.
 - In this OneDrive-backed folder, Python bytecode caching may be restricted, so some verification tools that write `.pyc` files can fail even when source code is valid.

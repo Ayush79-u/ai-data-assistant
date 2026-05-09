@@ -3,7 +3,7 @@ streamlit_app.py — Simple, friendly UI for the AI Data Assistant.
 
 Features:
 - Removed "Table options" sidebar block.
-- AI SQL generation via OpenRouter inside the SQL Editor.
+- Local-first SQL generation with Groq `llama-3.3-70b-versatile` fallback inside the SQL Editor.
 - DROP/TRUNCATE safety guard before any SQL run.
 - "✏️ Edit these results" button on chat result tables — loads them into
   the Table Editor for inline editing.
@@ -62,12 +62,14 @@ def _init_session() -> None:
         "prefill":              "",
         "blueprint":            None,
         "top_table_selector":   "",
+        "pending_table_select": None,
         "rename_table_name":    "",
         "rename_table_source":  "",
         "new_column_name":      "",
         "new_column_source":    "",
         "confirm_delete_table": False,
         "ai_nl_input":          "",
+        "auto_run_generated_sql": True,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -154,6 +156,7 @@ def _render_sidebar() -> None:
                 if result.success:
                     st.session_state.current_table = blueprint["table_name"]
                     st.session_state.blueprint = blueprint
+                    _queue_table_selection(blueprint["table_name"])
                     _set_sql_editor(result.sql_executed or blueprint.get("create_sql", ""))
                     _set_table_editor(
                         blueprint["table_name"],
@@ -340,7 +343,7 @@ def _render_chat_area() -> None:
                             num_rows="dynamic"
                         )
 
-                        st.warning("⚠️ This will overwrite the entire table")
+
 
                         col1, col2, col3 = st.columns(3)
 
@@ -353,11 +356,11 @@ def _render_chat_area() -> None:
                                 save_result = _eng().mysql.update_rows_by_id(
                                     target_tbl,
                                     edited_df,
-                                    id_column="EmpID"  # IMPORTANT for your table
+
                                 )
 
                                 if save_result.success:
-                                    st.success(f"✅ Updated {save_result.rows_affected} rows")
+                                    st.success(save_result.message or "Saved your changes.")
                                     st.rerun()
                                 else:
                                     st.error(save_result.error or "Save failed")
@@ -457,8 +460,10 @@ def _render_table_toolbar() -> None:
         _open_table(current, announce=False)
 
     selector_options = [""] + tables
-    if st.session_state.top_table_selector not in selector_options:
-        st.session_state.top_table_selector = current if current in tables else ""
+    _apply_pending_table_selection(
+        selector_options,
+        fallback=current if current in tables else "",
+    )
 
     if current and st.session_state.rename_table_source != current:
         st.session_state.rename_table_name = current
@@ -593,8 +598,8 @@ def _render_editors() -> None:
                 "💾 Save edits only",
                 use_container_width=True,
                 key=f"save_edits_{current}",
-                help="Updates only the rows shown here (matched by id). "
-                     "Safe for filtered query results.",
+                help="Updates the rows shown here using a safe unique column and "
+                     "can insert new rows when the table has a usable identifier.",
             ):
                 save_result = _save_edits_only()
                 if save_result.success:
@@ -614,13 +619,12 @@ def _render_editors() -> None:
                     st.rerun()
                 st.error(save_result.error or "Save failed.")
 
-    # SQL Editor — always available (also exposes the AI generator)
+    # SQL Editor - always available (also exposes the Groq fallback generator)
     if st.session_state.sql_editor_text or st.session_state.current_table:
         with st.expander("SQL Editor - tweak and re-run", expanded=False):
 
-            # ── AI SQL generation (OpenRouter) ────────────────────────
-            st.markdown("**🤖 Generate SQL with AI**")
-            ai_col_input, ai_col_btn = st.columns([4, 1.4])
+            st.markdown("**Generate SQL from English**")
+            ai_col_input, ai_col_btn, ai_col_toggle = st.columns([4, 1.4, 1.3])
             ai_col_input.text_input(
                 "Ask in English",
                 key="ai_nl_input",
@@ -628,14 +632,25 @@ def _render_editors() -> None:
                 label_visibility="collapsed",
             )
             if ai_col_btn.button(
-                "Generate SQL with AI",
+                "Generate SQL",
                 use_container_width=True,
                 key="ai_generate_sql_button",
             ):
-                _generate_sql_with_ai(st.session_state.get("ai_nl_input", ""))
-                st.rerun()
-            st.caption("Generated SQL appears below. Review it, then click Run SQL.")
-            # ──────────────────────────────────────────────────────────
+                should_rerun = _generate_sql_with_ai(
+                    st.session_state.get("ai_nl_input", ""),
+                    auto_run=st.session_state.auto_run_generated_sql,
+                )
+                if should_rerun:
+                    st.rerun()
+            ai_col_toggle.checkbox(
+                "Auto-run",
+                key="auto_run_generated_sql",
+                help="Automatically execute generated read-only SQL such as SELECT and SHOW.",
+            )
+            st.caption(
+                "Local generation runs first and fills the SQL editor. "
+                "Read-only SQL can be executed automatically."
+            )
 
             sql = st.text_area(
                 "SQL",
@@ -652,14 +667,13 @@ def _render_editors() -> None:
                 use_container_width=True,
                 key="run_sql_editor_button",
             ):
-                if not is_safe_sql(sql):
-                    st.error("Blocked: queries containing DROP or TRUNCATE are not allowed.")
-                else:
-                    result = _eng().execute_raw(sql)
-                    _log_query(result)
-                    _append("assistant", _result_summary(result), result)
-                    _set_sql_editor(sql)
+                result = _execute_sql_from_text(
+                    sql,
+                    intro="Executed the SQL from the editor.",
+                )
+                if result.success:
                     st.rerun()
+                st.error(result.error or "SQL execution failed.")
             if c2.button("Clear SQL", use_container_width=True, key="clear_sql_editor_button"):
                 st.session_state.sql_editor_text = ""
                 st.rerun()
@@ -769,15 +783,59 @@ def _friendly_reply(result: ExecutionResult) -> str:
 
 # ── AI SQL helper ─────────────────────────────────────────────────────────────
 
-def _generate_sql_with_ai(nl_input: str) -> None:
-    """Call OpenRouter and inject the generated SQL into the existing editor."""
+def _generate_sql_with_ai(nl_input: str, *, auto_run: bool = False) -> bool:
+    """Generate SQL locally first, then optionally auto-run safe read-only queries."""
     if not nl_input.strip():
         st.warning("Type what you want in plain English first.")
-        return
+        return False
 
+    try:
+        sql, generation_note = _generate_sql_from_request(nl_input)
+    except Exception as exc:
+        st.error(f"SQL generation failed: {exc}")
+        return False
+
+    _set_sql_editor(sql)
+
+    if auto_run and _is_read_only_sql(sql):
+        intro = "Generated SQL from your request and executed it automatically."
+        if generation_note:
+            intro += f" {generation_note}"
+        result = _execute_sql_from_text(
+            sql,
+            intro=intro,
+        )
+        if not result.success:
+            st.error(result.error or "SQL execution failed.")
+        return True
+
+    message = "Generated SQL from your request."
+    if auto_run and not _is_read_only_sql(sql):
+        message += " It changes data, so it was added to the SQL Editor for manual review."
+    else:
+        message += " Review it in the SQL Editor and click **Run SQL** when ready."
+    if generation_note:
+        message += f"\n\n_{generation_note}_"
+
+    _append("assistant", f"{message}\n\n```sql\n{sql}\n```")
+    st.success("SQL inserted into the editor.")
+    return True
+
+
+def _generate_sql_from_request(nl_input: str) -> tuple[str, str]:
     current = st.session_state.current_table
-    data_source = "excel" if st.session_state.get("excel_upload") is not None else "mysql"
 
+    try:
+        plan = _eng().preview_plan(nl_input, default_table=current)
+        if plan.intent != Intent.UNKNOWN:
+            sql = _eng().mysql.preview_plan_sql(plan)
+            return sql, "Used the local SQL generator."
+    except Exception as local_exc:
+        local_error = str(local_exc)
+    else:
+        local_error = "The local parser could not understand that request yet."
+
+    data_source = "excel" if st.session_state.get("excel_upload") is not None else "mysql"
     schema_str = ""
     try:
         if current:
@@ -788,34 +846,26 @@ def _generate_sql_with_ai(nl_input: str) -> None:
     except Exception as exc:
         schema_str = f"(could not load schema: {exc})"
 
-    try:
-        with st.spinner("Asking AI…"):
-            sql = generate_sql(
-                user_input=nl_input,
-                schema=schema_str,
-                table_name=current,
-                data_source=data_source,
-            )
-    except Exception as exc:
-        st.error(f"AI generation failed: {exc}")
-        return
-
-    _set_sql_editor(sql)
-    _append(
-        "assistant",
-        "Generated SQL from your request. Review it in the SQL Editor and "
-        f"click **Run SQL** when ready.\n\n```sql\n{sql}\n```",
+    sql = generate_sql(
+        user_input=nl_input,
+        schema=schema_str,
+        table_name=current,
+        data_source=data_source,
     )
-    st.success("SQL inserted into the editor.")
+    return sql, f"Used model-based fallback because the local generator could not finish: {local_error}"
 
 
 # ── Inline-edit-results helpers ───────────────────────────────────────────────
 
 def _infer_table_from_sql(sql: str) -> str:
-    """Extract the first table name from a SELECT statement, if it exists in MySQL."""
+    """Extract the first referenced table name if it exists in MySQL."""
     if not sql:
         return ""
-    match = re.search(r"\bFROM\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?", sql, re.IGNORECASE)
+    match = re.search(
+        r"\b(?:FROM|INTO|UPDATE|DESCRIBE|TABLE)\s+`?([a-zA-Z_][a-zA-Z0-9_]*)`?",
+        sql,
+        re.IGNORECASE,
+    )
     if not match:
         return ""
     table = match.group(1).lower()
@@ -826,6 +876,56 @@ def _infer_table_from_sql(sql: str) -> str:
         return ""
 
 
+def _is_read_only_sql(sql: str) -> bool:
+    first_word = sql.strip().split()[0].upper() if sql.strip() else ""
+    return first_word in {"SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"}
+
+
+def _execute_sql_from_text(sql: str, *, intro: str = "") -> ExecutionResult:
+    sql = (sql or "").strip()
+    if not sql:
+        return ExecutionResult(success=False, error="Enter a SQL command first.")
+
+    if not is_safe_sql(sql):
+        return ExecutionResult(
+            success=False,
+            error="Blocked: queries containing DROP or TRUNCATE are not allowed.",
+            sql_executed=sql,
+        )
+
+    result = _eng().execute_raw(sql)
+    _log_query(result)
+    _set_sql_editor(sql)
+    _sync_after_sql_execution(sql, result)
+
+    message_parts: list[str] = []
+    if intro:
+        message_parts.append(intro)
+    message_parts.append(f"```sql\n{sql}\n```")
+    if result.success:
+        message_parts.append(_friendly_reply(result))
+    else:
+        message_parts.append(f"Something went wrong: {result.error or result.message}")
+    _append("assistant", "\n\n".join(message_parts), result)
+    return result
+
+
+def _sync_after_sql_execution(sql: str, result: ExecutionResult) -> None:
+    if not result.success:
+        return
+
+    target_table = _infer_table_from_sql(result.sql_executed or sql)
+    if not target_table:
+        return
+
+    st.session_state.current_table = target_table
+    _queue_table_selection(target_table)
+    try:
+        _load_table_editor(target_table)
+    except Exception:
+        pass
+
+
 def _edit_query_results(table_name: str, df: pd.DataFrame) -> None:
     """Load query results into the Table Editor for inline editing."""
     _set_table_editor(table_name, df)
@@ -833,7 +933,7 @@ def _edit_query_results(table_name: str, df: pd.DataFrame) -> None:
         "assistant",
         f"Loaded these rows into the **Table Editor** below for `{table_name}`. "
         "Edit any cell, then choose how to save:\n\n"
-        "• **💾 Save edits only** — updates just the rows you see here (matched by id). "
+        "• **💾 Save edits only** — updates the rows you see here using a safe unique column. "
         "Use this when you filtered (e.g. only HR department).\n"
         "• **Save to MySQL (replace all)** — replaces ALL rows in the table with the editor contents. "
         "Use this only when the editor holds the full table.",
@@ -864,6 +964,29 @@ def _set_sql_editor(sql: str) -> None:
     st.session_state.sql_editor_text = sql
 
 
+def _queue_table_selection(table_name: str) -> None:
+    st.session_state.pending_table_select = table_name or ""
+
+
+def _apply_pending_table_selection(options: list[str], *, fallback: str = "") -> None:
+    """
+    Apply any pending programmatic table selection before the selectbox is created.
+
+    This keeps Streamlit widget state in sync without mutating the widget key
+    later in the render cycle.
+    """
+    desired = st.session_state.get("pending_table_select")
+    if desired is None:
+        desired = st.session_state.get("top_table_selector", "")
+        if desired not in options:
+            desired = fallback if fallback in options else ""
+    else:
+        desired = desired if desired in options else (fallback if fallback in options else "")
+
+    st.session_state.top_table_selector = desired
+    st.session_state.pending_table_select = None
+
+
 def _set_table_editor(table_name: str, df: pd.DataFrame) -> None:
     st.session_state.current_table = table_name
     st.session_state.table_editor_table = table_name
@@ -891,6 +1014,7 @@ def _open_table(table_name: str, *, announce: bool = False) -> None:
         sql_executed=sql,
         rows_affected=len(df),
     )
+    _queue_table_selection(table_name)
     _set_table_editor(table_name, df)
     _set_sql_editor(sql)
     if announce:
@@ -934,7 +1058,7 @@ def _save_current_table() -> ExecutionResult:
 
 
 def _save_edits_only() -> ExecutionResult:
-    """Update only the rows currently in the editor (matched by id)."""
+    """Update or insert only the rows currently shown in the editor."""
     current = st.session_state.current_table
     if not current:
         return ExecutionResult(success=False, error="No table is currently open.")
@@ -948,8 +1072,7 @@ def _save_edits_only() -> ExecutionResult:
         _set_sql_editor(save_result.sql_executed)
         _append(
             "assistant",
-            f"Updated edited rows in `{current}` "
-            f"({save_result.rows_affected} row(s) affected).",
+            save_result.message or f"Saved editor changes to `{current}`.",
             save_result,
         )
         _load_table_editor(current)
@@ -1001,6 +1124,7 @@ def _rename_current_table(new_name: str) -> ExecutionResult:
     _log_query(result)
     if result.success:
         _append("assistant", result.message or "Table renamed.", result)
+        _queue_table_selection(new_name)
         _open_table(new_name, announce=False)
     return result
 
@@ -1025,7 +1149,7 @@ def _delete_current_table() -> ExecutionResult:
         if remaining_tables:
             _open_table(remaining_tables[0], announce=False)
         else:
-            st.session_state.top_table_selector = ""
+            _queue_table_selection("")
             st.session_state.rename_table_name = ""
             st.session_state.rename_table_source = ""
     return result
@@ -1096,7 +1220,7 @@ def _end_conversation() -> None:
     st.session_state.table_editor_version += 1
     st.session_state.prefill = ""
     st.session_state.blueprint = None
-    st.session_state.top_table_selector = ""
+    _queue_table_selection("")
     st.session_state.rename_table_name = ""
     st.session_state.rename_table_source = ""
     st.session_state.confirm_delete_table = False

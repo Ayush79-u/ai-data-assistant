@@ -3,14 +3,28 @@ app.py - Streamlit entry point.
 Run with: streamlit run app.py
 """
 
+import os
 from pathlib import Path
 import sys
+
+from dotenv import find_dotenv, load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+
+def _bootstrap_environment() -> None:
+    env_path = find_dotenv()
+    if not env_path:
+        env_path = str(ROOT / ".env")
+    load_dotenv(env_path, override=True)
+    print("GROQ:", os.getenv("GROQ_API_KEY"))
+
+
+_bootstrap_environment()
 
 # Launch the main Streamlit UI that includes table creation,
 # table editing, SQL editing, and the chat workflow.

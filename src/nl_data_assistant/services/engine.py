@@ -43,12 +43,16 @@ class DataAssistantEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def parse(self, command: str, *, default_table: str = "") -> ActionPlan:
-        """Parse without executing. Useful for previewing / confirmation step."""
+    def preview_plan(self, command: str, *, default_table: str = "") -> ActionPlan:
+        """Parse without mutating conversation history."""
         schema = self.mysql.get_schema_summary()
         plan = interpret(command, schema_summary=schema, history=self._history)
         plan = plan.__class__(**{**plan.__dict__, "raw_command": command})
-        plan = self._apply_default_table(plan, default_table)
+        return self._apply_default_table(plan, default_table)
+
+    def parse(self, command: str, *, default_table: str = "") -> ActionPlan:
+        """Parse without executing. Useful for previewing / confirmation step."""
+        plan = self.preview_plan(command, default_table=default_table)
         # Append to history so the next call has context
         self._history.append({"role": "user", "content": command})
         return plan

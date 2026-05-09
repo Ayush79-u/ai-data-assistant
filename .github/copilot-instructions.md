@@ -12,7 +12,7 @@
   - Supported actions include `create_table`, `query`, `visualize`, `excel_to_mysql`, `mysql_to_excel`, `clean_data`, `describe_schema`.
   - Use explicit keywords like `import`, `export`, `clean`, `describe`, `show`, `create`, and chart types `bar|line|pie|scatter|histogram|dashboard`.
   - Target detection is keyword-based: Excel if command mentions `excel|sheet|workbook|.xlsx|.xls`; MySQL if it mentions `mysql|database|db|sql`.
-  - OpenAI parsing is optional and only used if `OPENAI_API_KEY` and `OPENAI_MODEL` are set.
+  - Groq SQL generation is optional and only used when the local SQL generator cannot finish the request and `GROQ_API_KEY` is set.
 
 - Service boundaries:
   - `ExcelService` handles workbook read/write/describe operations.
@@ -39,5 +39,5 @@
 
 - When editing:
   - Keep the rule-based parser and `tests/test_interpreter.py` in sync.
-  - Do not assume OpenAI is required; the rule parser is the primary command path.
+  - Do not assume Groq is required; the rule parser is the primary command path.
   - Preserve the distinction between Excel and MySQL targets, especially when actions are inferred by keywords.
