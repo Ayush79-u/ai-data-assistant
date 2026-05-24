@@ -30,6 +30,10 @@ from nl_data_assistant.config import settings
 from nl_data_assistant.models import ActionPlan, ExecutionResult
 from nl_data_assistant.nlp.mysql_query_generator import MySQLQueryGenerator
 from nl_data_assistant.nlp.table_blueprint import TableBlueprint
+from nl_data_assistant.nlp.schema_context import (
+    SchemaContext,
+    build_context_str,
+)
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +171,188 @@ class MySQLSessionService:
             cols = ", ".join(f"{col['name']} {col['type']}" for col in insp.get_columns(table))
             parts.append(f"{table}({cols})")
         return f"database: {target}; tables: " + "; ".join(parts) if parts else f"database: {target}; (no tables yet)"
+
+    # ------------------------------------------------------------------
+    # Schema-aware AI context pipeline
+    # ------------------------------------------------------------------
+
+    def build_ai_schema_context(
+        self,
+        database: str | None = None,
+        table_hints: list[str] | None = None,
+    ) -> SchemaContext:
+        """
+        Build a rich SchemaContext for AI SQL generation.
+
+        Scans up to _AI_MAX_TABLES tables and fetches:
+        - Column names + types (DESCRIBE)
+        - Sample rows (SELECT * LIMIT _AI_SAMPLE_ROWS)
+        - Distinct values for low-cardinality text columns
+
+        Results are cached for _SCHEMA_CACHE_TTL_SECONDS to avoid
+        repeated DB round-trips on each Streamlit rerun.
+
+        Parameters
+        ----------
+        database    : target database (defaults to current)
+        table_hints : if provided, these tables are listed first
+        """
+        target = self._resolve_database(database)
+        if not target:
+            return SchemaContext()
+
+        hint_key = tuple(sorted(table_hints or []))
+        cache_key = (target, hint_key)
+        now = time.time()
+
+        cached = self._schema_context_cache.get(cache_key)
+        if cached:
+            cached_at, cached_ctx = cached
+            if now - cached_at < self._SCHEMA_CACHE_TTL_SECONDS:
+                log.debug("schema_context cache hit for %s", cache_key)
+                return cached_ctx  # type: ignore[return-value]
+
+        log.debug("Building AI schema context for database=%s hints=%s", target, hint_key)
+
+        all_tables = self.get_table_names(target)
+
+        # Prioritise hinted tables so the active table is always included
+        ordered: list[str] = []
+        if table_hints:
+            for hint in table_hints:
+                real = next((t for t in all_tables if t.lower() == hint.lower()), None)
+                if real and real not in ordered:
+                    ordered.append(real)
+        for t in all_tables:
+            if t not in ordered:
+                ordered.append(t)
+
+        tables_to_scan = ordered[: self._AI_MAX_TABLES]
+
+        tables_data: list[dict[str, Any]] = []
+        column_map: dict[str, list[str]] = {}
+        categorical_map: dict[str, dict[str, list[str]]] = {}
+
+        for tbl in tables_to_scan:
+            tbl_data = self._fetch_table_schema_data(tbl, target)
+            tables_data.append(tbl_data)
+            column_map[tbl] = [c["name"] for c in tbl_data["columns"]]
+            categorical_map[tbl] = tbl_data["categoricals"]
+
+        context_str = build_context_str(target, tables_data)
+
+        ctx = SchemaContext(
+            database=target,
+            context_str=context_str,
+            table_names=tables_to_scan,
+            column_map=column_map,
+            categorical_map=categorical_map,
+        )
+
+        self._schema_context_cache[cache_key] = (now, ctx)  # type: ignore[assignment]
+        return ctx
+
+    def _fetch_table_schema_data(self, table_name: str, database: str) -> dict[str, Any]:
+        """Fetch column info, sample rows, and categorical values for one table."""
+        engine = self._database_engine(database)
+        insp   = inspect(engine)
+
+        raw_cols = insp.get_columns(table_name)
+        columns  = [{"name": c["name"], "type": str(c["type"])} for c in raw_cols]
+
+        # Sample rows
+        sample_rows: list[dict[str, Any]] = []
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(f"SELECT * FROM `{table_name}` LIMIT :n;"),
+                    {"n": self._AI_SAMPLE_ROWS},
+                )
+                keys = list(result.keys())
+                for row in result.fetchall():
+                    sample_rows.append(dict(zip(keys, row)))
+        except Exception as exc:  # pragma: no cover
+            log.warning("Could not fetch sample rows for %s: %s", table_name, exc)
+
+        # Distinct values for low-cardinality text columns
+        categoricals = self._fetch_distinct_values(table_name, columns, database)
+
+        return {
+            "name":        table_name,
+            "columns":     columns,
+            "sample_rows": sample_rows,
+            "categoricals": categoricals,
+        }
+
+    def _fetch_distinct_values(
+        self,
+        table_name: str,
+        columns: list[dict[str, Any]],
+        database: str,
+    ) -> dict[str, list[str]]:
+        """
+        For text-like columns, fetch distinct values if cardinality is low.
+        Skips columns whose names match the sensitive-column list.
+        """
+        from nl_data_assistant.nlp.schema_context import _is_sensitive  # local import avoids circular
+
+        engine = self._database_engine(database)
+        result_map: dict[str, list[str]] = {}
+
+        text_type_prefixes = ("varchar", "char", "text", "enum", "set")
+
+        with engine.connect() as conn:
+            for col in columns:
+                col_name = col["name"]
+                col_type = col["type"].lower()
+
+                if _is_sensitive(col_name):
+                    continue
+
+                if not any(col_type.startswith(p) for p in text_type_prefixes):
+                    continue
+
+                try:
+                    # Check cardinality first (cheap COUNT DISTINCT)
+                    count_result = conn.execute(
+                        text(
+                            f"SELECT COUNT(DISTINCT `{col_name}`) "
+                            f"FROM `{table_name}` WHERE `{col_name}` IS NOT NULL;"
+                        )
+                    ).scalar()
+                    cardinality = int(count_result or 0)
+
+                    if cardinality == 0 or cardinality > self._AI_LOW_CARDINALITY_THRESHOLD:
+                        continue
+
+                    vals_result = conn.execute(
+                        text(
+                            f"SELECT DISTINCT `{col_name}` "
+                            f"FROM `{table_name}` "
+                            f"WHERE `{col_name}` IS NOT NULL "
+                            f"ORDER BY `{col_name}` "
+                            f"LIMIT :lim;"
+                        ),
+                        {"lim": self._AI_DISTINCT_VALUE_LIMIT},
+                    )
+                    vals = [str(row[0]) for row in vals_result.fetchall() if row[0] is not None]
+                    if vals:
+                        result_map[col_name] = vals
+
+                except Exception as exc:  # pragma: no cover
+                    log.debug("Skipping distinct values for %s.%s: %s", table_name, col_name, exc)
+
+        return result_map
+
+    def invalidate_schema_cache(self, database: str | None = None) -> None:
+        """Clear cached schema context for one database (or all)."""
+        if database:
+            self._schema_context_cache = {
+                k: v for k, v in self._schema_context_cache.items()
+                if k[0] != database
+            }
+        else:
+            self._schema_context_cache.clear()
 
     def fetch_table(
         self,
@@ -716,10 +902,20 @@ class MySQLSessionService:
         return sql
 
     def execute_sql(self, sql: str) -> ExecutionResult:
+        from nl_data_assistant.nlp.ai_sql_generator import is_safe_sql  # avoid circular import
         raw_statements = sqlparse.split(sql) if sqlparse else sql.split(";")
         statements = [statement.strip() for statement in raw_statements if statement.strip()]
         if not statements:
             return ExecutionResult(success=False, error="Enter a SQL command.")
+
+        # Defence-in-depth: block dangerous statements regardless of the caller
+        for statement in statements:
+            if not is_safe_sql(statement):
+                return ExecutionResult(
+                    success=False,
+                    error="Blocked: this statement type is not permitted.",
+                    sql_executed=statement,
+                )
 
         combined_sql: list[str] = []
         last_data: pd.DataFrame | None = None

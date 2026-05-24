@@ -16,7 +16,8 @@ ENV_PATH = find_dotenv() or str(ROOT / ".env")
 
 # Load .env as early and as explicitly as possible.
 load_dotenv(ENV_PATH, override=True)
-print("GROQ:", os.getenv("GROQ_API_KEY"))
+log = __import__("logging").getLogger(__name__)
+log.debug("GROQ_API_KEY is %s", "set" if os.getenv("GROQ_API_KEY") else "NOT SET")
 
 _REQUIRED_MYSQL = ["MYSQL_HOST", "MYSQL_USER"]
 

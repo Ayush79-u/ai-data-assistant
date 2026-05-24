@@ -1,5 +1,9 @@
 """
 api_models.py — Pydantic request / response schemas for the FastAPI layer.
+
+Security notes:
+  - RunRequest no longer exposes skip_confirmation (removed — security risk)
+  - ExecuteRequest no longer accepts a raw 'sql' field (SQL injection vector removed)
 """
 from __future__ import annotations
 
@@ -11,21 +15,22 @@ from pydantic import BaseModel, Field
 # ── Requests ──────────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    command: str = Field(..., min_length=1, description="Natural-language command")
-    skip_confirmation: bool = Field(
-        False,
-        description="Set to True to execute destructive ops without a confirmation round-trip.",
-    )
+    command: str = Field(..., min_length=1, max_length=2000,
+                         description="Natural-language command (max 2000 chars)")
+    # skip_confirmation intentionally removed from the public API.
+    # Destructive operations always require the two-step parse→confirm→execute flow.
 
 
 class ExecuteRequest(BaseModel):
-    """Execute a pre-parsed plan — use the output of /parse."""
+    """Execute a pre-parsed plan — use the output of /parse.
+    The 'sql' field has been removed. Callers cannot submit raw SQL directly.
+    """
     intent: str
     table_name: str = ""
     columns: list[str] = []
     values: list[dict[str, Any]] = []
     conditions: str = ""
-    sql: str = ""
+    # sql: str = ""  ← REMOVED: was a SQL injection vector
     raw_command: str = ""
 
 

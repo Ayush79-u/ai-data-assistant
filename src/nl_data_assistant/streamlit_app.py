@@ -16,6 +16,8 @@ Features:
 from __future__ import annotations
 
 import io
+import logging
+import os
 import re
 import tempfile
 from datetime import datetime
@@ -24,8 +26,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+log = logging.getLogger(__name__)
+
 from nl_data_assistant.models import ExecutionResult, Intent
 from nl_data_assistant.nlp.ai_sql_generator import generate_sql, is_safe_sql
+from nl_data_assistant.nlp.schema_context import SchemaContext
 from nl_data_assistant.nlp.table_blueprint import TableBlueprint
 from nl_data_assistant.services.engine import DataAssistantEngine
 
@@ -70,6 +75,8 @@ def _init_session() -> None:
         "confirm_delete_table": False,
         "ai_nl_input":          "",
         "auto_run_generated_sql": True,
+        "schema_ctx":           None,   # cached SchemaContext for AI generation
+        "schema_ctx_table":     "",     # which table the cache is for
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -242,7 +249,8 @@ def _render_sidebar() -> None:
         with st.expander("Export table to Excel", expanded=False):
             tbl = st.selectbox("Table to export", tables, key="export_tbl")
             if st.button("Export", use_container_width=True):
-                out = Path(tempfile.gettempdir()) / f"{tbl}_export.xlsx"
+                import uuid as _uuid2
+                out = Path(tempfile.gettempdir()) / ("export_" + _uuid2.uuid4().hex + ".xlsx")
                 _eng().sync.mysql_to_excel(tbl, out)
                 st.download_button(
                     f"Download {tbl}.xlsx",
@@ -422,7 +430,8 @@ def _render_chat_area() -> None:
                     st.plotly_chart(result.data, use_container_width=True)
 
             if result and result.error:
-                st.error(result.error)
+                log.error("Result error (not shown to user): %s", result.error)
+                st.error("An error occurred. Please try again.")
 
     # =========================
     # DESTRUCTIVE CONFIRMATION
@@ -652,6 +661,19 @@ def _render_editors() -> None:
                 "Read-only SQL can be executed automatically."
             )
 
+            # Schema context badge ──────────────────────────────────────────
+            cached_ctx: SchemaContext | None = st.session_state.get("schema_ctx")
+            if cached_ctx and not cached_ctx.is_empty():
+                tbl_list = ", ".join(f"`{t}`" for t in cached_ctx.table_names[:4])
+                if len(cached_ctx.table_names) > 4:
+                    tbl_list += f" +{len(cached_ctx.table_names) - 4} more"
+                st.success(
+                    f"🔍 Schema loaded — {len(cached_ctx.table_names)} table(s): {tbl_list}",
+                    icon="✅",
+                )
+            elif st.session_state.current_table:
+                st.info("Schema will be loaded when you click Generate SQL.", icon="ℹ️")
+
             sql = st.text_area(
                 "SQL",
                 value=st.session_state.sql_editor_text,
@@ -789,6 +811,11 @@ def _generate_sql_with_ai(nl_input: str, *, auto_run: bool = False) -> bool:
         st.warning("Type what you want in plain English first.")
         return False
 
+    # Security: limit input length to prevent API abuse / ReDoS
+    if len(nl_input) > 2000:
+        st.error("Input too long. Please keep your request under 2000 characters.")
+        return False
+
     try:
         sql, generation_note = _generate_sql_from_request(nl_input)
     except Exception as exc:
@@ -823,36 +850,92 @@ def _generate_sql_with_ai(nl_input: str, *, auto_run: bool = False) -> bool:
 
 
 def _generate_sql_from_request(nl_input: str) -> tuple[str, str]:
-    current = st.session_state.current_table
+    """
+    Generate SQL from a natural-language request.
 
+    Priority order (schema-aware first):
+      1. Build SchemaContext from the active DB (cached, fast on repeat calls).
+      2. If Groq API key is present  -> call Groq with the FULL schema context
+         so it sees exact column names, types, sample values, and categorical
+         values.  This is the primary path for all natural-language queries.
+      3. If Groq fails or is unavailable -> fall back to the local rule-based
+         parser (structural queries like SHOW / DESCRIBE still work offline).
+
+    Why this order?
+    The local parser does NOT know actual categorical values (e.g. 'HR', 'IT'),
+    so it produces weak SQL like  LOWER(dept) = 'hr department'  instead of
+    the correct  WHERE Department = 'HR'.  Groq with schema context produces
+    accurate, case-matched SQL.
+    """
+    current = st.session_state.current_table
+    data_source = "excel" if st.session_state.get("excel_upload") is not None else "mysql"
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+
+    # ── 1. Build schema context (session-level + service-level TTL cache) ──────
+    schema_ctx: SchemaContext | None = None
+    try:
+        cached_ctx: SchemaContext | None = st.session_state.get("schema_ctx")
+        cached_tbl: str = st.session_state.get("schema_ctx_table", "")
+
+        if cached_ctx is not None and cached_tbl == current and not cached_ctx.is_empty():
+            schema_ctx = cached_ctx
+        else:
+            hints = [current] if current else None
+            schema_ctx = _eng().mysql.build_ai_schema_context(table_hints=hints)
+            st.session_state.schema_ctx       = schema_ctx
+            st.session_state.schema_ctx_table = current
+    except Exception as exc:
+        log.warning("Could not build schema context: %s", exc)
+        schema_ctx = None
+
+    # ── 2. Groq with full schema context (PRIMARY path) ────────────────────
+    if groq_api_key:
+        try:
+            sql = generate_sql(
+                user_input=nl_input,
+                schema=schema_ctx,
+                table_name=current,
+                data_source=data_source,
+            )
+            tbl_count = len(schema_ctx.table_names) if schema_ctx and not schema_ctx.is_empty() else 0
+            note = (
+                f"Used schema-aware AI generation ({tbl_count} table(s) in context)."
+                if tbl_count
+                else "Used AI generation (no schema context available)."
+            )
+            return sql, note
+        except ValueError as exc:
+            # Hard block (hallucination guard / safety) — surface immediately
+            raise ValueError(str(exc)) from exc
+        except Exception as exc:
+            log.warning("Groq generation failed, falling back to local parser: %s", exc)
+            groq_error = str(exc)
+    else:
+        groq_error = "GROQ_API_KEY not set."
+
+    # -- 3. Local rule-based parser (FALLBACK when Groq unavailable/failed) ---
+    local_sql = ""
+    local_error = ""
     try:
         plan = _eng().preview_plan(nl_input, default_table=current)
         if plan.intent != Intent.UNKNOWN:
-            sql = _eng().mysql.preview_plan_sql(plan)
-            return sql, "Used the local SQL generator."
+            local_sql = _eng().mysql.preview_plan_sql(plan)
     except Exception as local_exc:
         local_error = str(local_exc)
-    else:
-        local_error = "The local parser could not understand that request yet."
 
-    data_source = "excel" if st.session_state.get("excel_upload") is not None else "mysql"
-    schema_str = ""
-    try:
-        if current:
-            cols = _eng().mysql.get_table_columns(current)
-            schema_str = ", ".join(f"{c['name']} {c['type']}" for c in cols)
-        else:
-            schema_str = _eng().mysql.get_schema_summary()
-    except Exception as exc:
-        schema_str = f"(could not load schema: {exc})"
+    if local_sql:
+        note = "Used the local SQL generator."
+        if groq_error:
+            note += f" (Groq unavailable: {groq_error})"
+        return local_sql, note
 
-    sql = generate_sql(
-        user_input=nl_input,
-        schema=schema_str,
-        table_name=current,
-        data_source=data_source,
+    # Both paths failed - raise a helpful error
+    raise RuntimeError(
+        f"Could not generate SQL. "
+        "", # error details logged, not shown  #
+        f"Local parser: {local_error or 'could not understand the request'}. "
+        "Please try rephrasing your request."
     )
-    return sql, f"Used model-based fallback because the local generator could not finish: {local_error}"
 
 
 # ── Inline-edit-results helpers ───────────────────────────────────────────────
@@ -905,7 +988,8 @@ def _execute_sql_from_text(sql: str, *, intro: str = "") -> ExecutionResult:
     if result.success:
         message_parts.append(_friendly_reply(result))
     else:
-        message_parts.append(f"Something went wrong: {result.error or result.message}")
+        log.error("SQL execution error (not shown to user): %s", result.error or result.message)
+        message_parts.append("Something went wrong. Please check your input and try again.")
     _append("assistant", "\n\n".join(message_parts), result)
     return result
 

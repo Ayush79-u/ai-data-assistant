@@ -21,7 +21,6 @@ def _bootstrap_environment() -> None:
     if not env_path:
         env_path = str(ROOT / ".env")
     load_dotenv(env_path, override=True)
-    print("GROQ:", os.getenv("GROQ_API_KEY"))
 
 
 _bootstrap_environment()

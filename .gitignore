@@ -13,3 +13,6 @@ outputs/*.html
 outputs/*.xlsx
 outputs/*.csv
 
+# Security: never commit source code dumps or patch scripts
+all_code.txt
+patch_*.py

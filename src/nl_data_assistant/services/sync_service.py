@@ -62,8 +62,12 @@ class SyncService:
     def _create_table_from_df(self, df: pd.DataFrame, table_name: str) -> None:
         col_defs = ["  `id` INT AUTO_INCREMENT PRIMARY KEY"]
         for col in df.columns:
+            # Sanitize column name from Excel to prevent DDL injection
+            safe_col = _sanitize_identifier(str(col))
+            if not safe_col:
+                safe_col = f"col_{len(col_defs)}"
             mysql_type = _infer_mysql_type(df[col])
-            col_defs.append(f"  `{col}` {mysql_type}")
+            col_defs.append(f"  `{safe_col}` {mysql_type}")
         ddl = (
             f"DROP TABLE IF EXISTS `{table_name}`;\n"
             f"CREATE TABLE `{table_name}` (\n"
@@ -83,17 +87,18 @@ class SyncService:
         table_name: str,
         file_path: Path | str,
         sheet_name: str | None = None,
-        conditions: str = "",
         limit: int | None = None,
     ) -> Path:
         """
         Export a MySQL table to an Excel file.
         Returns the path to the written file.
+
+        NOTE: The 'conditions' parameter has been intentionally removed.
+        It was a SQL injection vector (raw user string concatenated into SQL).
+        Use parameterized queries or the NL interface for filtered exports.
         """
         safe_name = _sanitize_identifier(table_name)
         sql = f"SELECT * FROM `{safe_name}`"
-        if conditions:
-            sql += f" WHERE {conditions}"
         if limit:
             sql += f" LIMIT {int(limit)}"
 
