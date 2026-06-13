@@ -12,7 +12,6 @@ import logging
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine
 
 from nl_data_assistant.config import settings
 from nl_data_assistant.models import ActionPlan, ExecutionResult, Intent
@@ -28,14 +27,10 @@ log = logging.getLogger(__name__)
 
 class DataAssistantEngine:
     def __init__(self):
-        sync_engine = create_engine(
-            settings.mysql_url_for(settings.default_database) if settings.default_database else settings.mysql_server_url,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-        )
         self.mysql = MySQLSessionService(default_database=settings.default_database)
         self.excel = ExcelService(settings.default_workbook)
-        self.sync = SyncService(sync_engine, self.excel)
+        # Reuse the engine already created inside MySQLSessionService
+        self.sync = SyncService(self.mysql._server_engine, self.excel)
         self.viz = VisualizationService()
 
         # Multi-turn conversation history shared across all calls

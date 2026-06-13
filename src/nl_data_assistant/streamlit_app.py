@@ -52,9 +52,18 @@ def run_streamlit_app() -> None:
 
 # ── Session init ──────────────────────────────────────────────────────────────
 
+
+@st.cache_resource(show_spinner="Connecting to database…")
+def _get_engine() -> DataAssistantEngine:
+    """Create the DataAssistantEngine once and reuse it across all reruns.
+    st.cache_resource persists the object for the lifetime of the server process.
+    """
+    return DataAssistantEngine()
+
+
 def _init_session() -> None:
     defaults = {
-        "engine":               DataAssistantEngine(),
+        "engine":               _get_engine(),
         "chat":                 [],
         "pending_plan":         None,
         "query_log":            [],

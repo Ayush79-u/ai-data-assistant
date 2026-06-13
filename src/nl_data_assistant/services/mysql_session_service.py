@@ -104,9 +104,9 @@ class MySQLSessionService:
         )
         self._database_engines: dict[str, Engine] = {}
         self._schema_context_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        # Set the current database lazily — validated on first use, not at startup
+        # to avoid an unnecessary DB round-trip during cold start.
         self._current_database = default_database.strip() or settings.default_database
-        if self._current_database and self._current_database not in self.get_database_names():
-            self._current_database = ""
 
     @property
     def current_database(self) -> str:
