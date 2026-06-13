@@ -40,6 +40,9 @@ class Settings:
     mysql_user: str = os.getenv("MYSQL_USER", "root")
     mysql_password: str = os.getenv("MYSQL_PASSWORD", "")
     mysql_database: str = os.getenv("MYSQL_DATABASE", "ai_data_assistant")
+    # Set MYSQL_SSL=false in .env to disable SSL (e.g., for local dev)
+    # TiDB Cloud and most managed cloud DBs require SSL=true
+    mysql_ssl: bool = os.getenv("MYSQL_SSL", "true").lower() not in ("false", "0", "no")
 
     default_target: str = os.getenv("DEFAULT_TARGET", "mysql")
     default_workbook: Path = Path(
@@ -55,13 +58,15 @@ class Settings:
         """
         Build safe MySQL connection URL.
         Handles special characters in password (like @, :, /, etc.)
+        Appends ssl_disabled=false for TiDB Cloud and other SSL-required hosts.
         """
         encoded_password = quote_plus(self.mysql_password)  # 🔥 CRITICAL FIX
+        ssl_param = "&ssl_disabled=false" if self.mysql_ssl else ""
 
         return (
             f"mysql+pymysql://{self.mysql_user}:{encoded_password}"
             f"@{self.mysql_host}:{self.mysql_port}"
-            "?charset=utf8mb4"
+            f"?charset=utf8mb4{ssl_param}"
         )
 
     def mysql_url_for(self, database: str | None = None) -> str:
