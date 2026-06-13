@@ -58,16 +58,26 @@ class Settings:
         """
         Build safe MySQL connection URL.
         Handles special characters in password (like @, :, /, etc.)
-        Appends ssl_disabled=false for TiDB Cloud and other SSL-required hosts.
+        NOTE: SSL is passed via connect_args in the engine, NOT in the URL,
+        because PyMySQL does not support ssl_disabled as a URL parameter.
         """
         encoded_password = quote_plus(self.mysql_password)  # 🔥 CRITICAL FIX
-        ssl_param = "&ssl_disabled=false" if self.mysql_ssl else ""
-
         return (
             f"mysql+pymysql://{self.mysql_user}:{encoded_password}"
             f"@{self.mysql_host}:{self.mysql_port}"
-            f"?charset=utf8mb4{ssl_param}"
+            "?charset=utf8mb4"
         )
+
+    @property
+    def ssl_connect_args(self) -> dict:
+        """
+        Returns connect_args dict for SQLAlchemy engine creation.
+        Passing an empty ssl dict tells PyMySQL to use SSL (TiDB Cloud requires it).
+        Set MYSQL_SSL=false in .env to disable for local dev without SSL.
+        """
+        if self.mysql_ssl:
+            return {"ssl": {"check_hostname": False}}
+        return {}
 
     def mysql_url_for(self, database: str | None = None) -> str:
         target_database = (database if database is not None else self.default_database).strip()

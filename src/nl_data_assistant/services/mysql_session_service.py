@@ -98,6 +98,7 @@ class MySQLSessionService:
     ):
         self._server_engine = server_engine or create_engine(
             settings.mysql_server_url,
+            connect_args=settings.ssl_connect_args,
             pool_pre_ping=True,
             pool_recycle=3600,
         )
@@ -1130,6 +1131,7 @@ class MySQLSessionService:
         if database not in self._database_engines:
             self._database_engines[database] = create_engine(
                 settings.mysql_url_for(database),
+                connect_args=settings.ssl_connect_args,
                 pool_pre_ping=True,
                 pool_recycle=3600,
             )
