@@ -45,49 +45,242 @@ def run_streamlit_app() -> None:
         initial_sidebar_state="expanded",
     )
     _inject_css()
+
+    # Show login screen until user has a valid DB connection
+    if not st.session_state.get("db_connected"):
+        _render_login_screen()
+        return
+
+    _init_session()
+    _render_header()
+- DROP/TRUNCATE safety guard before any SQL run.
+- "✏️ Edit these results" button on chat result tables — loads them into
+  the Table Editor for inline editing.
+- Two save modes in the Table Editor:
+    • "💾 Save edits only"  — updates rows by id (safe for filtered results)
+    • "Save to MySQL (replace all)" — old replace-all behavior
+- All other features preserved: chat, Excel import/export, blueprint builder,
+  query history, destructive confirmation, etc.
+"""
+from __future__ import annotations
+
+import io
+import logging
+import os
+import re
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+log = logging.getLogger(__name__)
+
+from nl_data_assistant.models import ExecutionResult, Intent
+from nl_data_assistant.nlp.ai_sql_generator import generate_sql, is_safe_sql
+from nl_data_assistant.nlp.schema_context import SchemaContext
+from nl_data_assistant.nlp.table_blueprint import TableBlueprint
+from nl_data_assistant.services.engine import DataAssistantEngine
+
+
+# ── Page config ───────────────────────────────────────────────────────────────
+
+def run_streamlit_app() -> None:
+    st.set_page_config(
+        page_title="Data Assistant",
+        page_icon="🧠",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    _inject_css()
+
+    # Show login screen until user has a valid DB connection
+    if not st.session_state.get("db_connected"):
+        _render_login_screen()
+        return
+
     _init_session()
     _render_header()
     _render_body()
 
 
+# ── Login screen ──────────────────────────────────────────────────────────────
+
+def _render_login_screen() -> None:
+    """Full-page database connection form shown before the main app."""
+    st.markdown("""
+    <style>
+    /* Hide sidebar on login page */
+    [data-testid="stSidebar"] { display: none; }
+    section.main > div { padding-top: 2rem; }
+
+    .login-hero {
+        text-align: center;
+        padding: 2.5rem 0 1.5rem 0;
+    }
+    .login-hero h1 {
+        font-size: 2.8rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #7c3aed, #2563eb, #06b6d4);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.3rem;
+    }
+    .login-hero p {
+        color: #94a3b8;
+        font-size: 1.05rem;
+        margin: 0;
+    }
+    .preset-btn {
+        display: inline-block;
+        padding: 0.35rem 1rem;
+        border-radius: 20px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        margin: 0.2rem;
+    }
+    .conn-card {
+        background: rgba(30, 41, 59, 0.85);
+        border: 1px solid rgba(99, 102, 241, 0.25);
+        border-radius: 16px;
+        padding: 2rem 2.2rem 2rem 2.2rem;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+        max-width: 520px;
+        margin: 0 auto;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Hero header
+    st.markdown("""
+    <div class="login-hero">
+        <h1>🧠 Data Assistant</h1>
+        <p>Connect your MySQL database and start asking questions in plain English</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Centre the card
+    _, card_col, _ = st.columns([1, 2.2, 1])
+
+    with card_col:
+        st.markdown('<div class="conn-card">', unsafe_allow_html=True)
+
+        st.markdown("#### 🔌 Connect to your database")
+
+        # Quick presets
+        preset = st.selectbox(
+            "Quick preset",
+            ["TiDB Cloud (port 4000, SSL)", "Regular MySQL (port 3306)", "Custom"],
+            key="login_preset",
+        )
+        tidb_preset = preset.startswith("TiDB")
+        default_port  = 4000 if tidb_preset else 3306
+        default_ssl   = tidb_preset
+
+        host = st.text_input(
+            "Host",
+            placeholder="e.g. gateway01.ap-southeast-1.prod.alicloud.tidbcloud.com",
+            key="login_host",
+        )
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            user = st.text_input("Username", placeholder="root", key="login_user")
+        with c2:
+            port = st.number_input("Port", value=default_port, min_value=1, max_value=65535, key="login_port")
+
+        password = st.text_input("Password", type="password", key="login_password")
+        database = st.text_input("Database name", placeholder="test", key="login_database")
+        use_ssl  = st.toggle("Use SSL (required for TiDB Cloud)", value=default_ssl, key="login_ssl")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        if st.button("🚀 Connect", type="primary", use_container_width=True, key="login_btn"):
+            if not host or not user:
+                st.error("Host and Username are required.")
+            else:
+                with st.spinner("Testing connection…"):
+                    try:
+                        from urllib.parse import quote_plus
+                        from sqlalchemy import create_engine, text as sa_text
+
+                        encoded_pass = quote_plus(password)
+                        db_part = f"/{database.strip()}" if database.strip() else ""
+                        url = (
+                            f"mysql+pymysql://{user}:{encoded_pass}"
+                            f"@{host.strip()}:{int(port)}{db_part}?charset=utf8mb4"
+                        )
+                        _connect_args = {"ssl": {"check_hostname": False}} if use_ssl else {}
+
+                        test_engine = create_engine(
+                            url,
+                            connect_args=_connect_args,
+                            pool_pre_ping=True,
+                        )
+                        with test_engine.connect() as conn:
+                            conn.execute(sa_text("SELECT 1"))
+                        test_engine.dispose()
+
+                        # Store credentials in session state
+                        st.session_state["db_url"]          = url
+                        st.session_state["db_connect_args"] = _connect_args
+                        st.session_state["db_database"]     = database.strip()
+                        st.session_state["db_host_label"]   = f"{user}@{host.strip()}"
+                        st.session_state["db_connected"]    = True
+                        st.success("Connected! Loading app…")
+                        st.rerun()
+
+                    except Exception:
+                        st.error(
+                            "❌ Connection failed — please check your host, username, "
+                            "password, port, and SSL setting."
+                        )
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 # ── Session init ──────────────────────────────────────────────────────────────
 
-
-@st.cache_resource(show_spinner="Connecting to database…")
-def _get_engine() -> DataAssistantEngine:
-    """Create the DataAssistantEngine once and reuse it across all reruns.
-    st.cache_resource persists the object for the lifetime of the server process.
-    """
-    return DataAssistantEngine()
-
-
 def _init_session() -> None:
-    defaults = {
-        "engine":               _get_engine(),
-        "chat":                 [],
-        "pending_plan":         None,
-        "query_log":            [],
-        "current_table":        "",
-        "table_editor_df":      pd.DataFrame(),
-        "table_editor_table":   "",
-        "table_editor_version": 0,
-        "sql_editor_text":      "",
-        "sql_result":           None,
-        "prefill":              "",
-        "blueprint":            None,
-        "top_table_selector":   "",
-        "pending_table_select": None,
-        "rename_table_name":    "",
-        "rename_table_source":  "",
-        "new_column_name":      "",
-        "new_column_source":    "",
-        "confirm_delete_table": False,
-        "ai_nl_input":          "",
+    # Create engine once per session using user-provided credentials
+    if "engine" not in st.session_state:
+        db_url       = st.session_state.get("db_url")
+        connect_args = st.session_state.get("db_connect_args", {})
+        db_database  = st.session_state.get("db_database", "")
+        st.session_state["engine"] = DataAssistantEngine(
+            db_url=db_url,
+            connect_args=connect_args,
+            default_database=db_database,
+        )
+
+    simple_defaults: dict = {
+        "chat":                   [],
+        "pending_plan":           None,
+        "query_log":              [],
+        "current_table":          "",
+        "table_editor_df":        pd.DataFrame(),
+        "table_editor_table":     "",
+        "table_editor_version":   0,
+        "sql_editor_text":        "",
+        "sql_result":             None,
+        "prefill":                "",
+        "blueprint":              None,
+        "top_table_selector":     "",
+        "pending_table_select":   None,
+        "rename_table_name":      "",
+        "rename_table_source":    "",
+        "new_column_name":        "",
+        "new_column_source":      "",
+        "confirm_delete_table":   False,
+        "ai_nl_input":            "",
         "auto_run_generated_sql": True,
-        "schema_ctx":           None,   # cached SchemaContext for AI generation
-        "schema_ctx_table":     "",     # which table the cache is for
+        "schema_ctx":             None,
+        "schema_ctx_table":       "",
     }
-    for k, v in defaults.items():
+    for k, v in simple_defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -99,11 +292,12 @@ def _eng() -> DataAssistantEngine:
 # ── Header ────────────────────────────────────────────────────────────────────
 
 def _render_header() -> None:
-    col_title, col_db, col_save, col_clear = st.columns([4, 3, 1.5, 1])
+    col_title, col_db, col_save, col_clear, col_disc = st.columns([3.5, 3, 1.5, 1, 1])
 
     with col_title:
         st.markdown("## Data Assistant")
-        st.caption("Talk in simple English and work on the selected table.")
+        label = st.session_state.get("db_host_label", "")
+        st.caption(f"Connected as **{label}**" if label else "Talk in simple English and work on the selected table.")
 
     with col_db:
         if _eng().mysql.ping():
@@ -113,7 +307,7 @@ def _render_header() -> None:
                 icon="✅",
             )
         else:
-            st.error("MySQL unreachable - check your .env file", icon="🔴")
+            st.error("MySQL unreachable — reconnect below", icon="🔴")
             st.stop()
 
     with col_save:
@@ -129,6 +323,13 @@ def _render_header() -> None:
     with col_clear:
         if st.button("End conversation", use_container_width=True):
             _end_conversation()
+            st.rerun()
+
+    with col_disc:
+        if st.button("🔌 Disconnect", use_container_width=True, help="Switch to a different database"):
+            # Clear all session state to show login screen again
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
 
     st.divider()

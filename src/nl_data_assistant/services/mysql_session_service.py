@@ -95,13 +95,27 @@ class MySQLSessionService:
         server_engine: Engine | None = None,
         *,
         default_database: str = "",
+        db_url: str | None = None,
+        connect_args: dict | None = None,
     ):
-        self._server_engine = server_engine or create_engine(
-            settings.mysql_server_url,
-            connect_args=settings.ssl_connect_args,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-        )
+        if server_engine:
+            self._server_engine = server_engine
+        elif db_url:
+            # User-supplied connection URL (from login screen)
+            self._server_engine = create_engine(
+                db_url,
+                connect_args=connect_args or {},
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
+        else:
+            # Fall back to global settings (from .env / Streamlit secrets)
+            self._server_engine = create_engine(
+                settings.mysql_server_url,
+                connect_args=settings.ssl_connect_args,
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
         self._database_engines: dict[str, Engine] = {}
         self._schema_context_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         # Set the current database lazily — validated on first use, not at startup
@@ -117,7 +131,7 @@ class MySQLSessionService:
             with self._server_engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             return True
-        except OperationalError:
+        except Exception:
             return False
 
     def get_database_names(self) -> list[str]:

@@ -26,8 +26,17 @@ log = logging.getLogger(__name__)
 
 
 class DataAssistantEngine:
-    def __init__(self):
-        self.mysql = MySQLSessionService(default_database=settings.default_database)
+    def __init__(
+        self,
+        db_url: str | None = None,
+        connect_args: dict | None = None,
+        default_database: str = "",
+    ):
+        self.mysql = MySQLSessionService(
+            db_url=db_url,
+            connect_args=connect_args,
+            default_database=default_database or settings.default_database,
+        )
         self.excel = ExcelService(settings.default_workbook)
         # Reuse the engine already created inside MySQLSessionService
         self.sync = SyncService(self.mysql._server_engine, self.excel)
